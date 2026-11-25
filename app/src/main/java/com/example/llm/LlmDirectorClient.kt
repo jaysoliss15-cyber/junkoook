@@ -198,12 +198,13 @@ class LlmDirectorClient(
                             apiKey = apiKey,
                             systemPrompt = blueprintSystem,
                             userPrompt = blueprintUser,
-                            extraHeaders = extraHeaders
+                            extraHeaders = extraHeaders,
+                            useJsonObjectMode = false
                         )
                     )
                 }
 
-                // PASS 2: Granular Scene Production (strict JSON array)
+                // PASS 2: Granular Scene Production (structured JSON object {"scenes": [...]})
                 onStatus("Pass 2/2: Producing dense scenes via $providerName (try $attempt/3)...")
                 val retryHint = if (attempt > 1) {
                     "Previous output failed JSON/quality validation (${lastJsonError?.message ?: "error"}). Fix all issues immediately."
@@ -227,7 +228,8 @@ class LlmDirectorClient(
                     apiKey = apiKey,
                     systemPrompt = pass2SystemPrompt,
                     userPrompt = sceneUserPrompt,
-                    extraHeaders = extraHeaders
+                    extraHeaders = extraHeaders,
+                    useJsonObjectMode = true
                 )
 
                 val initialScenes = JsonSanitizer.parseAndValidateScenes(rawText)
@@ -243,7 +245,8 @@ class LlmDirectorClient(
                         apiKey = apiKey,
                         systemPrompt = buildPass2SystemPrompt(systemPrompt),
                         userPrompt = repairUserPrompt,
-                        extraHeaders = extraHeaders
+                        extraHeaders = extraHeaders,
+                        useJsonObjectMode = true
                     )
                 }
                 return Result.success(LlmScriptResult(scenes = validatedScenes, providerUsed = providerName))
@@ -324,7 +327,45 @@ class LlmDirectorClient(
         apiKey: String,
         systemPrompt: String,
         userPrompt: String,
-        extraHeaders: Map<String, String>
+        extraHeaders: Map<String, String>,
+        useJsonObjectMode: Boolean = false
+    ): String {
+        return try {
+            executeWithReasoningRetry(
+                url = url,
+                model = model,
+                apiKey = apiKey,
+                systemPrompt = systemPrompt,
+                userPrompt = userPrompt,
+                extraHeaders = extraHeaders,
+                includeResponseFormat = useJsonObjectMode
+            )
+        } catch (e: LlmHttpException) {
+            // Some third-party OpenAI proxies reject response_format with HTTP 400; retry once without it.
+            if (useJsonObjectMode && isUnsupportedResponseFormatError(e.statusCode, e.rawBody)) {
+                executeWithReasoningRetry(
+                    url = url,
+                    model = model,
+                    apiKey = apiKey,
+                    systemPrompt = systemPrompt,
+                    userPrompt = userPrompt,
+                    extraHeaders = extraHeaders,
+                    includeResponseFormat = false
+                )
+            } else {
+                throw e
+            }
+        }
+    }
+
+    private fun executeWithReasoningRetry(
+        url: String,
+        model: String,
+        apiKey: String,
+        systemPrompt: String,
+        userPrompt: String,
+        extraHeaders: Map<String, String>,
+        includeResponseFormat: Boolean
     ): String {
         val (firstChoice, firstBody) = performSingleOpenAiChatCompletion(
             url = url,
@@ -333,7 +374,8 @@ class LlmDirectorClient(
             systemPrompt = systemPrompt,
             userPrompt = userPrompt,
             extraHeaders = extraHeaders,
-            temperature = DEFAULT_TEMPERATURE
+            temperature = DEFAULT_TEMPERATURE,
+            includeResponseFormat = includeResponseFormat
         )
         if (firstChoice.content.isNotBlank()) {
             return firstChoice.content
@@ -348,7 +390,8 @@ class LlmDirectorClient(
                 systemPrompt = systemPrompt,
                 userPrompt = userPrompt,
                 extraHeaders = extraHeaders,
-                temperature = REASONING_RETRY_TEMPERATURE
+                temperature = REASONING_RETRY_TEMPERATURE,
+                includeResponseFormat = includeResponseFormat
             )
             if (retryChoice.content.isNotBlank()) {
                 return retryChoice.content
@@ -374,7 +417,8 @@ class LlmDirectorClient(
         systemPrompt: String,
         userPrompt: String,
         extraHeaders: Map<String, String>,
-        temperature: Double
+        temperature: Double,
+        includeResponseFormat: Boolean
     ): Pair<OpenAiChoiceResult, String> {
         val cleanKey = UniversalModelDetector.cleanCredential(apiKey)
         val cleanModel = UniversalModelDetector.cleanCredential(model)
@@ -384,6 +428,11 @@ class LlmDirectorClient(
             put("model", cleanModel)
             put("temperature", temperature)
             put("max_tokens", MAX_TOKENS)
+            if (includeResponseFormat) {
+                put("response_format", JSONObject().apply {
+                    put("type", "json_object")
+                })
+            }
             put("messages", JSONArray().apply {
                 put(JSONObject().apply {
                     put("role", "system")
@@ -427,7 +476,15 @@ class LlmDirectorClient(
         const val REASONING_RETRY_TEMPERATURE = 0.4
 
         const val STRICT_JSON_OUTPUT_FOOTER =
-            "CRITICAL OUTPUT FORMAT: Return ONLY a raw JSON array starting with [ and ending with ], with zero markdown fences or commentary"
+            "CRITICAL OUTPUT FORMAT: Return ONLY a raw JSON object {\"scenes\": [ ... ]} with zero markdown fences or commentary."
+
+        fun isUnsupportedResponseFormatError(statusCode: Int, rawBody: String): Boolean {
+            if (statusCode != 400) return false
+            val lower = rawBody.lowercase()
+            return lower.contains("response_format") ||
+                lower.contains("json_object") ||
+                lower.contains("structured_outputs")
+        }
 
         const val TAGALOG_CHARS_PER_SECOND = 15.5
         const val SCENE_PAUSE_SEC = 0.45
@@ -601,7 +658,7 @@ Output ONLY the numbered plain-text outline now (do NOT output JSON in Pass 1).
                 append("- Consecutive scenes MUST NOT repeat the same camera_motion, character_pose, or shot_framing (never use STATIC).\n")
                 append("- TOPIC-FIRST RULE: Derive 100% of characters, wardrobe, environment_theme, props, cutaway_diagram_prompt, and diagrams strictly from the Topic & Blueprint.\n\n")
                 append(buildDurationContractBlock(budget))
-                append("\n\nProduce all ${budget.targetSceneCount} scenes now.\n")
+                append("\n\nProduce all ${budget.targetSceneCount} scenes inside {\"scenes\": [...]} now.\n")
                 append(STRICT_JSON_OUTPUT_FOOTER)
             }
         }
@@ -647,7 +704,7 @@ Output ONLY the numbered plain-text outline now (do NOT output JSON in Pass 1).
                 append("- \"tagalog_narration\": >= $MIN_WORDS_PER_NARRATION words and >= $MIN_CHARS_PER_NARRATION chars of natural Tagalog.\n")
                 append("- \"visual_description\": >= $MIN_WORDS_PER_VISUAL_DESCRIPTION words explicitly covering (1) main subject & exact action/pose, (2) facial expression & hand prop, (3) specific environment/foreground/background elements, (4) lighting/atmosphere; zero 'generic', 'simple background', or 'etc'.\n")
                 append("- Valid non-STATIC \"camera_motion\", explicit \"character_pose\", and explicit \"shot_framing\" distinct from adjacent scenes.\n")
-                append("\nInclude ONLY scene_id(s): ${targetSceneIds.joinToString(", ")}.\n")
+                append("\nInclude ONLY scene_id(s): ${targetSceneIds.joinToString(", ")} inside {\"scenes\": [...]}.\n")
                 append(STRICT_JSON_OUTPUT_FOOTER)
             }
         }

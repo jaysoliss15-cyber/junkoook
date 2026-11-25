@@ -87,8 +87,8 @@ Mga Panuntunan sa Kuwento:
                 "OPTIONAL MOTION-GRAPHICS & DIAGRAMS: Include diagram_type (left_label/right_label/step_1..3) and HUD fields whenever visual comparison or causal steps clarify the topic."
         }
         return """
-Return ONLY a valid JSON array containing exactly $sceneCount scene objects (each representing 3–5 seconds of narration for a ~${durationSeconds}s vertical 9:16 video in "${style.displayName}" aesthetic).
-Do NOT output any prose, explanation, markdown fences, or <think> tags outside the JSON array.
+Return ONLY a valid JSON object matching {"scenes": [ ... ]} where "scenes" holds exactly $sceneCount scene objects (each representing 3–5 seconds of narration for a ~${durationSeconds}s vertical 9:16 video in "${style.displayName}" aesthetic).
+Do NOT output any prose, explanation, markdown fences, or <think> tags outside the JSON object.
 
 TOPIC-FIRST DECOUPLING CONTRACT (CRITICAL ARCHITECTURE RULE):
 - "${style.displayName}" defines ONLY the visual rendering aesthetic and camera feel—NEVER the story characters, props, or subject matter!
@@ -105,51 +105,51 @@ ANTI-TEMPLATE VISUAL VARIETY RULES (MANDATORY):
 - Vary "shot_framing", "character_pose", "camera_motion", and "environment_theme" on EVERY cut—NEVER repeat the exact same "camera_motion", "character_pose", or "shot_framing" on two consecutive scenes!
 - Match character wardrobe & identity ("character_gender", "character_age", "character_outfit", "outfit_color_hex", "hair_color_hex", "hand_prop") to who is speaking in the topic (e.g. FEMALE + ELDERLY + MARKET_APRON + BASKET_GOODS for a tindera lola; YOUNG_ADULT + MEDICAL_SCRUBS for a nurse; CHILD + STUDENT_UNIFORM + BOOK_NOTEBOOK for a pupil).
 
-Every object in the JSON array MUST have ALL required keys with exact names:
+Every object inside "scenes" MUST have ALL required keys with exact names:
 - "scene_id": integer starting at 1
 - "tagalog_narration": string (natural conversational Tagalog/Taglish, MINIMUM 11 words and MINIMUM 60 characters per scene, no stage directions or speaker labels)
 - "visual_description": string (MINIMUM 18 words in vivid English explicitly detailing ALL 4 items: 1. main subject & exact action/pose, 2. facial expression & hand prop, 3. specific environment/foreground/background elements, 4. lighting/atmosphere; NEVER use "generic", "simple background", or "etc")
 - "background_prompt": string (vivid English background diorama description matching "${style.displayName}" aesthetic and time of day, no text, no people)
-- "camera_motion": strictly one of ["ZOOM_IN", "ZOOM_OUT", "PAN_LEFT", "PAN_RIGHT", "TRACKING_FOLLOW", "IMPACT_SHAKE", "WHIP_PAN_LEFT", "WHIP_PAN_RIGHT", "SHAKE"] (NEVER "STATIC" or repeating the previous scene's motion!)
-- "actor_role": strictly one of ["NARRATOR", "HERO", "RICH_MAN", "POOR_MAN", "CHICKEN_MENTOR"] (prefer "NARRATOR" or "HERO" paired with character_outfit/gender/age for everyday people!)
-- "actor_action": strictly one of ["WALK_IN", "TALK_BOUNCE", "THUMBS_UP", "POINT_STICK", "SURPRISED_JUMP", "CRY_SHAKE"]
-- "world_fx": strictly one of ["NONE", "COIN_RAIN", "FIRE_SPARKS", "CHALKBOARD_DRAW"]
+- "camera_motion": strictly one of ZOOM_IN | ZOOM_OUT | PAN_LEFT | PAN_RIGHT | TRACKING_FOLLOW | IMPACT_SHAKE | WHIP_PAN_LEFT | WHIP_PAN_RIGHT | SHAKE (NEVER "STATIC" or repeating the previous scene's motion!)
+- "actor_role": strictly one of NARRATOR | HERO | RICH_MAN | POOR_MAN | CHICKEN_MENTOR (prefer "NARRATOR" or "HERO" paired with character_outfit/gender/age for everyday people!)
+- "actor_action": strictly one of WALK_IN | TALK_BOUNCE | THUMBS_UP | POINT_STICK | SURPRISED_JUMP | CRY_SHAKE
+- "world_fx": strictly one of NONE | COIN_RAIN | FIRE_SPARKS | CHALKBOARD_DRAW
 
 $hudGuidance
 Optional cinematic, wardrobe, cutaway & data-driven diagram keys per scene object:
-- "environment_theme": one of ["BRIGHT_MORNING_KITCHEN", "SUNNY_MARKET_STREET", "MODERN_OFFICE_DESK", "COZY_BEDROOM_MIDNIGHT", "CLASSROOM_CHALKBOARD", "BANK_VAULT_FINANCE", "SUNNY_PARK_NATURE", "SCIENCE_LAB_INTERIOR", "HOSPITAL_CLINIC", "ABSTRACT_STUDIO_GRADIENT", "DRAMATIC_SUNSET_CITY"]
-- "character_gender": one of ["MALE", "FEMALE"]
-- "character_age": one of ["CHILD", "YOUNG_ADULT", "MIDDLE_AGED", "ELDERLY"]
-- "character_outfit": one of ["CASUAL_TSHIRT", "MARKET_APRON", "OFFICE_SUIT", "STUDENT_UNIFORM", "MEDICAL_SCRUBS", "HOODIE", "WORK_UNIFORM"]
+- "environment_theme": one of BRIGHT_MORNING_KITCHEN | SUNNY_MARKET_STREET | MODERN_OFFICE_DESK | COZY_BEDROOM_MIDNIGHT | CLASSROOM_CHALKBOARD | BANK_VAULT_FINANCE | SUNNY_PARK_NATURE | SCIENCE_LAB_INTERIOR | HOSPITAL_CLINIC | ABSTRACT_STUDIO_GRADIENT | DRAMATIC_SUNSET_CITY
+- "character_gender": one of MALE | FEMALE
+- "character_age": one of CHILD | YOUNG_ADULT | MIDDLE_AGED | ELDERLY
+- "character_outfit": one of CASUAL_TSHIRT | MARKET_APRON | OFFICE_SUIT | STUDENT_UNIFORM | MEDICAL_SCRUBS | HOODIE | WORK_UNIFORM
 - "outfit_color_hex": vibrant hex string for shirt/outfit (e.g. "#E11D48", "#0EA5E9", "#16A34A")
 - "hair_color_hex": hex string for hair color (e.g. "#1F2937", "#78350F", "#D1D5DB")
-- "shot_framing": one of ["WIDE_FULL_BODY", "MEDIUM_WAIST_UP", "CLOSE_UP_FACE", "RULE_OF_THIRDS_LEFT", "RULE_OF_THIRDS_RIGHT"] (NEVER repeat the previous scene's framing!)
-- "character_pose": one of ["WALK_ACROSS_LEFT_TO_RIGHT", "THREE_QUARTER_EXPLAIN", "SIT_SLUMPED", "SHOCK_AIRBORNE_RECOIL", "POINT_AND_GESTURE", "CELEBRATE_JUMP", "TWO_CHARACTER_CONVERSATION"] (NEVER repeat the previous scene's pose!)
-- "hand_prop": one of ["NONE", "POINTER_STICK", "MONEY_BAG", "PHONE_SCREEN", "COFFEE_CUP", "BASKET_GOODS", "BOOK_NOTEBOOK", "TOOL_WRENCH", "MAGNIFYING_GLASS", "LIGHTBULB"]
-- "shot_type": one of ["WIDE_STAGE", "MEDIUM_WAIST_UP", "CLOSE_UP_REACTION", "TRACKING_FOLLOW", "WHIP_CUT"]
-- "secondary_actor_role": optional partner role for TWO_CHARACTER_CONVERSATION (["HERO", "NARRATOR", "RICH_MAN", "POOR_MAN", "CHICKEN_MENTOR"])
-- "expression": one of ["HAPPY_TALK", "ANGRY_EVIL", "PANIC_SWEAT_FIRE", "SHOCKED_WIDE_EYES", "TONGUE_STING", "SLEEPING_ZZZ"]
-- "headgear": one of ["NONE", "CHEF_HAT", "HARD_HAT", "CROWN"]
-- "diagram_type": one of ["NONE", "BEFORE_AFTER_SPLIT", "STEP_FLOW_ARROWS", "METER_GAUGE_SHIFT", "SCALE_WEIGH_OFF", "SUNBURST_HERO_CALLOUT"]
+- "shot_framing": one of WIDE_FULL_BODY | MEDIUM_WAIST_UP | CLOSE_UP_FACE | RULE_OF_THIRDS_LEFT | RULE_OF_THIRDS_RIGHT (NEVER repeat the previous scene's framing!)
+- "character_pose": one of WALK_ACROSS_LEFT_TO_RIGHT | THREE_QUARTER_EXPLAIN | SIT_SLUMPED | SHOCK_AIRBORNE_RECOIL | POINT_AND_GESTURE | CELEBRATE_JUMP | TWO_CHARACTER_CONVERSATION (NEVER repeat the previous scene's pose!)
+- "hand_prop": one of NONE | POINTER_STICK | MONEY_BAG | PHONE_SCREEN | COFFEE_CUP | BASKET_GOODS | BOOK_NOTEBOOK | TOOL_WRENCH | MAGNIFYING_GLASS | LIGHTBULB
+- "shot_type": one of WIDE_STAGE | MEDIUM_WAIST_UP | CLOSE_UP_REACTION | TRACKING_FOLLOW | WHIP_CUT
+- "secondary_actor_role": optional partner role for TWO_CHARACTER_CONVERSATION (HERO | NARRATOR | RICH_MAN | POOR_MAN | CHICKEN_MENTOR)
+- "expression": one of HAPPY_TALK | ANGRY_EVIL | PANIC_SWEAT_FIRE | SHOCKED_WIDE_EYES | TONGUE_STING | SLEEPING_ZZZ
+- "headgear": one of NONE | CHEF_HAT | HARD_HAT | CROWN
+- "diagram_type": one of NONE | BEFORE_AFTER_SPLIT | STEP_FLOW_ARROWS | METER_GAUGE_SHIFT | SCALE_WEIGH_OFF | SUNBURST_HERO_CALLOUT
 - "left_label": short 1–3 word label for BEFORE_AFTER_SPLIT or SCALE_WEIGH_OFF left side
 - "right_label": short 1–3 word label for BEFORE_AFTER_SPLIT or SCALE_WEIGH_OFF right side
 - "step_1": short 1–3 word step for STEP_FLOW_ARROWS
 - "step_2": short 1–3 word step for STEP_FLOW_ARROWS
 - "step_3": short 1–3 word step for STEP_FLOW_ARROWS
-- "metaphor_visual": optional topic-matched visual from ["NONE", "TIME_LAPSE_CLOCK", "BOILING_POT_PROCESS", "SUNBURST_SPOTLIGHT", "CRACKING_EGG_CHICK", "GROWING_MONEY_TREE", "BRAIN_BATTERY_DRAIN", "SCALE_BALANCE_COMPARE", "ROCKET_GROWTH_CHART", "LOCK_AND_KEY_SECRET", "SHIELD_BLOCKING_ARROWS", "DOMINO_CHAIN_REACTION", "CHOMP_CHAIN", "TISSUE_CROSS_SECTION"]
+- "metaphor_visual": optional topic-matched visual from NONE | TIME_LAPSE_CLOCK | BOILING_POT_PROCESS | SUNBURST_SPOTLIGHT | CRACKING_EGG_CHICK | GROWING_MONEY_TREE | BRAIN_BATTERY_DRAIN | SCALE_BALANCE_COMPARE | ROCKET_GROWTH_CHART | LOCK_AND_KEY_SECRET | SHIELD_BLOCKING_ARROWS | DOMINO_CHAIN_REACTION | CHOMP_CHAIN | TISSUE_CROSS_SECTION
 - "topic_pill": short 1–3 word uppercase badge text derived strictly from the topic
-- "status_pill": one of ["NONE", "GOAL", "PROBLEM", "FIX", "SECRET"]
+- "status_pill": one of NONE | GOAL | PROBLEM | FIX | SECRET
 - "callout_banner": short 1–3 word punchy Tagalog/Taglish emphasis text derived from the topic
-- "hud_widget": one of ["NONE", "PROGRESS_GAUGE", "WAVEFORM_GRAPH", "ANIMATED_CHECKLIST"]
+- "hud_widget": one of NONE | PROGRESS_GAUGE | WAVEFORM_GRAPH | ANIMATED_CHECKLIST
 - "hud_label": short uppercase metric title derived from the topic
 - "hud_from_value": integer 0..100
 - "hud_to_value": integer 0..100
-- "checklist_items": array of 2–4 short strings (only when hud_widget is "ANIMATED_CHECKLIST")
+- "checklist_items": JSON array of 2–4 short strings (only when hud_widget is "ANIMATED_CHECKLIST")
 - "cutaway_diagram_prompt": vivid English description of the topic-specific cross-section cutaway diagram (no text, no labels) for PIXEL_CUTAWAY_EXPLAINER or CROSS_SECTION
-- "flow_direction": one of ["UP", "DOWN", "LEFT_TO_RIGHT", "RADIAL_BURST"]
-- "cutaway_subject": optional ["BRAIN_NEURON_SIGNAL", "SKIN_WOUND_HEALING", "TOOTH_ENAMEL_DECAY", "HEART_ARTERY_FLOW", "BATTERY_CIRCUIT_CHARGE", "SOIL_ROOT_GROWTH"] (ONLY if topic matches!)
-- "cutaway_stage": one of ["SURFACE_ZOOM_IN", "CROSS_SECTION_DAMAGE", "IMMUNE_CLEANUP", "STRAND_AND_VESSEL_REBUILD", "CELL_MIGRATION_CLOSE", "SURFACE_HEALED_ZOOM_OUT"]
-- "pointer_callouts": array of 1–2 objects [{"label": "TOPIC FEATURE", "x": 135, "y": 175}] targeting features on a 270x480 cross-section
+- "flow_direction": one of UP | DOWN | LEFT_TO_RIGHT | RADIAL_BURST
+- "cutaway_subject": optional (BRAIN_NEURON_SIGNAL | SKIN_WOUND_HEALING | TOOTH_ENAMEL_DECAY | HEART_ARTERY_FLOW | BATTERY_CIRCUIT_CHARGE | SOIL_ROOT_GROWTH) (ONLY if topic matches!)
+- "cutaway_stage": one of SURFACE_ZOOM_IN | CROSS_SECTION_DAMAGE | IMMUNE_CLEANUP | STRAND_AND_VESSEL_REBUILD | CELL_MIGRATION_CLOSE | SURFACE_HEALED_ZOOM_OUT
+- "pointer_callouts": JSON array of 1–2 objects each with "label" (e.g. "TOPIC FEATURE"), "x" (35..235), and "y" (115..335) targeting features on a 270x480 cross-section
         """.trimIndent()
     }
 

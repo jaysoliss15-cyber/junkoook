@@ -1377,16 +1377,21 @@ class ToonForgeCoreTest {
     }
 
     @Test
-    fun `jsonSanitizerUnwrapsObjectWrappersShowsRawSnippetAndDirectorSeparatesPass1AndPass2`() {
-        // 1. Unwrap {"scenes": [...]} wrapper (even with preceding string array)
-        val scenesWrapped = """
-            {"title": "Budgeting [Demo]", "tags": ["pinoy", "ipon"], "scenes": [{"scene_id": 1, "tagalog_narration": "Una"}]}
+    fun `jsonSanitizerUnwrapsObjectWrappersShowsRawSnippetAndDirectorEnforcesJsonObjectMode`() {
+        // 1. Ignores [Scene 1], ["tag1", "tag2"], and non-scene object arrays earlier in the response
+        val noisyPrefixResponse = """
+            [Scene 1] Draft thoughts here.
+            ["tag1", "tag2"]
+            [{"label": "Intro Card", "weight": 1}]
+            {"title": "Budgeting Demo", "tags": ["pinoy", "ipon"], "scenes": [{"scene_id": 1, "tagalog_narration": "Una"}]}
         """.trimIndent()
-        val unwrappedScenes = JsonSanitizer.extractJsonArrayText(scenesWrapped)
+        val unwrappedScenes = JsonSanitizer.extractJsonArrayText(noisyPrefixResponse)
         assertTrue(unwrappedScenes.startsWith("["))
         assertTrue(unwrappedScenes.endsWith("]"))
         assertTrue(unwrappedScenes.contains("\"scene_id\": 1"))
         assertFalse(unwrappedScenes.contains("\"tags\""))
+        assertFalse(unwrappedScenes.contains("Intro Card"))
+        assertFalse(unwrappedScenes.contains("Scene 1"))
 
         // 2. Unwrap {"storyboard": [...]} inside ```json ... ``` fence with [Note] prose outside
         val fencedStoryboard = """
@@ -1403,7 +1408,15 @@ class ToonForgeCoreTest {
         assertTrue(unwrappedStoryboard.contains("\"scene_id\": 1"))
         assertFalse(unwrappedStoryboard.contains("\"scene_id\": 2"))
 
-        // 3. Raw 220-char diagnostic snippet when no JSON array brackets exist
+        // 3. Rejects responses containing only string arrays or no scene objects and includes raw snippet
+        var stringArrayRejected = false
+        try {
+            JsonSanitizer.extractJsonArrayText("[Scene 1] Only tags [\"tag1\", \"tag2\"] here.")
+        } catch (e: MalformedSceneJsonException) {
+            stringArrayRejected = e.message.orEmpty().contains("Raw LLM output:")
+        }
+        assertTrue(stringArrayRejected)
+
         val longProse = "Pasensya na, ito ay isang kuwentong walang brackets! " + "X".repeat(300)
         var capturedMsg = ""
         try {
@@ -1415,8 +1428,8 @@ class ToonForgeCoreTest {
         assertTrue(capturedMsg.contains("Pasensya na, ito ay isang kuwentong walang brackets!"))
         assertTrue(capturedMsg.length <= "No JSON array brackets found. Raw LLM output: ".length + 220)
 
-        // 4. Pass 1 stays strictly plain-text outline; Pass 2 places CRITICAL OUTPUT FORMAT at VERY END
-        val customMasterPrompt = "Custom Master Prompt with [notes] and creative instructions."
+        // 4. Pass 1 stays strictly plain-text outline; Pass 2 places structured {"scenes": [...]} footer at VERY END
+        val customMasterPrompt = "Custom Master Prompt with creative instructions."
         val pass1Sys = LlmDirectorClient.buildBlueprintSystemPrompt(customMasterPrompt)
         assertTrue(pass1Sys.contains("PASS 1 PLAIN TEXT ONLY"))
         assertTrue(pass1Sys.contains("Ignore any JSON output instructions during Pass 1"))
@@ -1425,10 +1438,15 @@ class ToonForgeCoreTest {
         val pass1User = LlmDirectorClient.buildNarrativeBlueprintPrompt("Ipon", 30, AnimationStyle.PAPER_DIORAMA, budget30)
         assertTrue(pass1User.contains("do NOT output JSON in Pass 1"))
 
-        val expectedFooter = "CRITICAL OUTPUT FORMAT: Return ONLY a raw JSON array starting with [ and ending with ], with zero markdown fences or commentary"
+        val expectedFooter = "CRITICAL OUTPUT FORMAT: Return ONLY a raw JSON object {\"scenes\": [ ... ]} with zero markdown fences or commentary."
         assertEquals(expectedFooter, LlmDirectorClient.STRICT_JSON_OUTPUT_FOOTER)
 
         val composedSys = BuiltInPrompts.composeSystemPrompt(customMasterPrompt, 30, AnimationStyle.PAPER_DIORAMA)
+        assertTrue(composedSys.contains("{\"scenes\": [ ... ]}"))
+        assertFalse(composedSys.contains("[\"ZOOM_IN\""))
+        assertFalse(composedSys.contains("[A]"))
+        assertFalse(composedSys.contains("[B]"))
+
         val pass2Sys = LlmDirectorClient.buildPass2SystemPrompt(composedSys, retryHint = "Retry now.")
         assertTrue(pass2Sys.endsWith(expectedFooter))
 
@@ -1444,7 +1462,12 @@ class ToonForgeCoreTest {
         )
         assertTrue(repairUser.endsWith(expectedFooter))
 
-        // 5. Reasoning model empty-content retry & thinking-block stripping
+        // 5. HTTP 400 response_format fallback detection & reasoning model retry logic
+        assertTrue(LlmDirectorClient.isUnsupportedResponseFormatError(400, "{\"error\":\"Unsupported parameter: response_format\"}"))
+        assertTrue(LlmDirectorClient.isUnsupportedResponseFormatError(400, "json_object mode not supported by this model"))
+        assertFalse(LlmDirectorClient.isUnsupportedResponseFormatError(401, "Invalid response_format"))
+        assertFalse(LlmDirectorClient.isUnsupportedResponseFormatError(400, "{\"error\":\"Invalid API key\"}"))
+
         assertEquals(0.7, LlmDirectorClient.DEFAULT_TEMPERATURE, 0.001)
         assertEquals(0.4, LlmDirectorClient.REASONING_RETRY_TEMPERATURE, 0.001)
         assertTrue(LlmDirectorClient.shouldRetryReasoningFallback("", "Thinking step 1...", 0.7))
