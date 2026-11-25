@@ -49,17 +49,24 @@ jobs:
           retention-days: 14
 
       - name: Build Signed Release APK (optional if secrets configured)
-        if: ${{ secrets.KEYSTORE_BASE64 != '' && secrets.STORE_PASSWORD != '' && secrets.KEY_PASSWORD != '' }}
+        id: release_apk
         env:
-          KEYSTORE_PATH: ${{ github.workspace }}/release-upload-key.jks
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
           STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          KEYSTORE_PATH: ${{ github.workspace }}/release-upload-key.jks
         run: |
-          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > "${KEYSTORE_PATH}"
-          ./gradlew :app:assembleRelease --stacktrace
+          if [ -n "${KEYSTORE_BASE64}" ] && [ -n "${STORE_PASSWORD}" ] && [ -n "${KEY_PASSWORD}" ]; then
+            echo "${KEYSTORE_BASE64}" | base64 -d > "${KEYSTORE_PATH}"
+            ./gradlew :app:assembleRelease --stacktrace
+            echo "built=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Release signing secrets not configured; skipping release APK."
+            echo "built=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Upload Release APK Artifact (optional)
-        if: ${{ secrets.KEYSTORE_BASE64 != '' && secrets.STORE_PASSWORD != '' && secrets.KEY_PASSWORD != '' }}
+        if: steps.release_apk.outputs.built == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: toonforge-tagalog-release-apk
