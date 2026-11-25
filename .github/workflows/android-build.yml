@@ -22,10 +22,34 @@ jobs:
           distribution: temurin
           java-version: 21
 
-      - name: Restore debug keystore from base64
+      - name: Restore or generate debug keystore
         run: |
-          if [ ! -f debug.keystore ] && [ -f debug.keystore.base64 ]; then
-            base64 -d debug.keystore.base64 > debug.keystore
+          if [ ! -s debug.keystore ] && [ -s debug.keystore.base64 ]; then
+            tr -d '\r\n ' < debug.keystore.base64 | base64 -d > debug.keystore || rm -f debug.keystore
+          fi
+          NEED_FRESH_KEYSTORE=0
+          if [ ! -s debug.keystore ] || ! keytool -list -keystore debug.keystore -storepass android >/dev/null 2>&1; then
+            NEED_FRESH_KEYSTORE=1
+          else
+            # Regenerate if container-generated cert Valid-from timestamp is in the future on this runner
+            if python3 -c "import subprocess,re,datetime,sys; out=subprocess.check_output(['keytool','-list','-v','-keystore','debug.keystore','-storepass','android'],text=True); m=re.search(r'Valid from:\s*(.+?)\s+until:',out); dt=datetime.datetime.strptime(re.sub(r'\s+[A-Z]{2,5}\s+',' ',m.group(1).strip()),'%a %b %d %H:%M:%S %Y') if m else None; sys.exit(1 if (dt and dt>datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)) else 0)" 2>/dev/null; then
+              NEED_FRESH_KEYSTORE=0
+            else
+              NEED_FRESH_KEYSTORE=1
+            fi
+          fi
+          if [ "${NEED_FRESH_KEYSTORE}" -eq 1 ]; then
+            rm -f debug.keystore
+            keytool -genkeypair -v \
+              -keystore debug.keystore \
+              -storepass android \
+              -alias androiddebugkey \
+              -keypass android \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -startdate 2020/01/01 \
+              -dname "CN=Android Debug,O=Android,C=US"
           fi
 
       - name: Grant execute permission for Gradle wrapper
@@ -35,10 +59,10 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
 
       - name: Run Unit Tests
-        run: ./gradlew :app:testDebugUnitTest --stacktrace
+        run: ./gradlew :app:testDebugUnitTest --no-configuration-cache --max-workers=2 --console=plain --stacktrace
 
       - name: Build Debug APK
-        run: ./gradlew :app:assembleDebug --stacktrace
+        run: ./gradlew :app:assembleDebug --no-configuration-cache --max-workers=2 --console=plain --stacktrace
 
       - name: Upload Debug APK Artifact
         uses: actions/upload-artifact@v4
@@ -57,8 +81,8 @@ jobs:
           KEYSTORE_PATH: ${{ github.workspace }}/release-upload-key.jks
         run: |
           if [ -n "${KEYSTORE_BASE64}" ] && [ -n "${STORE_PASSWORD}" ] && [ -n "${KEY_PASSWORD}" ]; then
-            echo "${KEYSTORE_BASE64}" | base64 -d > "${KEYSTORE_PATH}"
-            ./gradlew :app:assembleRelease --stacktrace
+            echo "${KEYSTORE_BASE64}" | tr -d '\r\n ' | base64 -d > "${KEYSTORE_PATH}"
+            ./gradlew :app:assembleRelease --no-configuration-cache --max-workers=2 --console=plain --stacktrace
             echo "built=true" >> "$GITHUB_OUTPUT"
           else
             echo "Release signing secrets not configured; skipping release APK."
