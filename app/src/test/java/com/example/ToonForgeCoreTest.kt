@@ -1375,4 +1375,81 @@ class ToonForgeCoreTest {
         }
         assertTrue(shortRejected)
     }
+
+    @Test
+    fun `jsonSanitizerUnwrapsObjectWrappersShowsRawSnippetAndDirectorSeparatesPass1AndPass2`() {
+        // 1. Unwrap {"scenes": [...]} wrapper (even with preceding string array)
+        val scenesWrapped = """
+            {"title": "Budgeting [Demo]", "tags": ["pinoy", "ipon"], "scenes": [{"scene_id": 1, "tagalog_narration": "Una"}]}
+        """.trimIndent()
+        val unwrappedScenes = JsonSanitizer.extractJsonArrayText(scenesWrapped)
+        assertTrue(unwrappedScenes.startsWith("["))
+        assertTrue(unwrappedScenes.endsWith("]"))
+        assertTrue(unwrappedScenes.contains("\"scene_id\": 1"))
+        assertFalse(unwrappedScenes.contains("\"tags\""))
+
+        // 2. Unwrap {"storyboard": [...]} inside ```json ... ``` fence with [Note] prose outside
+        val fencedStoryboard = """
+            [Note] Here is the generated storyboard:
+            ```json
+            {
+              "storyboard": [
+                {"scene_id": 1, "tagalog_narration": "Alam mo ba ang sikreto sa ipon?"},
+                {"scene_id": 2, "tagalog_narration": "Heto ang pangalawang
+        """.trimIndent() + "\n```"
+        val unwrappedStoryboard = JsonSanitizer.extractJsonArrayText(fencedStoryboard)
+        assertTrue(unwrappedStoryboard.startsWith("["))
+        assertTrue(unwrappedStoryboard.endsWith("]"))
+        assertTrue(unwrappedStoryboard.contains("\"scene_id\": 1"))
+        assertFalse(unwrappedStoryboard.contains("\"scene_id\": 2"))
+
+        // 3. Raw 220-char diagnostic snippet when no JSON array brackets exist
+        val longProse = "Pasensya na, ito ay isang kuwentong walang brackets! " + "X".repeat(300)
+        var capturedMsg = ""
+        try {
+            JsonSanitizer.extractJsonArrayText(longProse)
+        } catch (e: MalformedSceneJsonException) {
+            capturedMsg = e.message.orEmpty()
+        }
+        assertTrue(capturedMsg.startsWith("No JSON array brackets found. Raw LLM output: "))
+        assertTrue(capturedMsg.contains("Pasensya na, ito ay isang kuwentong walang brackets!"))
+        assertTrue(capturedMsg.length <= "No JSON array brackets found. Raw LLM output: ".length + 220)
+
+        // 4. Pass 1 stays strictly plain-text outline; Pass 2 places CRITICAL OUTPUT FORMAT at VERY END
+        val customMasterPrompt = "Custom Master Prompt with [notes] and creative instructions."
+        val pass1Sys = LlmDirectorClient.buildBlueprintSystemPrompt(customMasterPrompt)
+        assertTrue(pass1Sys.contains("PASS 1 PLAIN TEXT ONLY"))
+        assertTrue(pass1Sys.contains("Ignore any JSON output instructions during Pass 1"))
+
+        val budget30 = LlmDirectorClient.calculateDurationBudget(30)
+        val pass1User = LlmDirectorClient.buildNarrativeBlueprintPrompt("Ipon", 30, AnimationStyle.PAPER_DIORAMA, budget30)
+        assertTrue(pass1User.contains("do NOT output JSON in Pass 1"))
+
+        val expectedFooter = "CRITICAL OUTPUT FORMAT: Return ONLY a raw JSON array starting with [ and ending with ], with zero markdown fences or commentary"
+        assertEquals(expectedFooter, LlmDirectorClient.STRICT_JSON_OUTPUT_FOOTER)
+
+        val composedSys = BuiltInPrompts.composeSystemPrompt(customMasterPrompt, 30, AnimationStyle.PAPER_DIORAMA)
+        val pass2Sys = LlmDirectorClient.buildPass2SystemPrompt(composedSys, retryHint = "Retry now.")
+        assertTrue(pass2Sys.endsWith(expectedFooter))
+
+        val pass2User = LlmDirectorClient.buildSceneProductionPrompt("Ipon", 30, AnimationStyle.PAPER_DIORAMA, budget30, "1. Beat one")
+        assertTrue(pass2User.endsWith(expectedFooter))
+
+        val repairUser = LlmDirectorClient.buildTargetedRepairPrompt(
+            workingScenes = emptyList(),
+            targetSceneIds = listOf(1),
+            report = LlmDirectorClient.validateSceneQuality(emptyList(), budget30),
+            budget = budget30,
+            blueprint = "1. Beat one"
+        )
+        assertTrue(repairUser.endsWith(expectedFooter))
+
+        // 5. Reasoning model empty-content retry & thinking-block stripping
+        assertEquals(0.7, LlmDirectorClient.DEFAULT_TEMPERATURE, 0.001)
+        assertEquals(0.4, LlmDirectorClient.REASONING_RETRY_TEMPERATURE, 0.001)
+        assertTrue(LlmDirectorClient.shouldRetryReasoningFallback("", "Thinking step 1...", 0.7))
+        assertFalse(LlmDirectorClient.shouldRetryReasoningFallback("", "Thinking step 1...", 0.4))
+        assertFalse(LlmDirectorClient.shouldRetryReasoningFallback("[{\"scene_id\":1}]", "Thinking step 1...", 0.7))
+        assertEquals("[{\"scene_id\":1}]", LlmDirectorClient.stripThinkingBlocks("<think>internal</think>\n[{\"scene_id\":1}]"))
+    }
 }

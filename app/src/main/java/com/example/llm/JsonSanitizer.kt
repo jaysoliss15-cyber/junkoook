@@ -32,8 +32,23 @@ object JsonSanitizer {
 
     private val THINK_BLOCK_REGEX = Regex("<think>[\\s\\S]*?</think>", RegexOption.IGNORE_CASE)
     private val UNCLOSED_THINK_REGEX = Regex("<think>[\\s\\S]*$", RegexOption.IGNORE_CASE)
+    private val FENCED_CODE_BLOCK_REGEX = Regex("```(?:json)?\\s*([\\s\\S]*?)```", RegexOption.IGNORE_CASE)
     private val CODE_FENCE_START = Regex("```(?:json)?\\s*", RegexOption.IGNORE_CASE)
     private val CODE_FENCE_END = Regex("```")
+
+    private val WRAPPER_ARRAY_KEYS = setOf(
+        "scenes",
+        "storyboard",
+        "scenes_list",
+        "scene_list",
+        "script",
+        "video_script",
+        "items",
+        "data",
+        "results",
+        "result",
+        "output"
+    )
 
     private val REQUIRED_KEYS = listOf(
         "scene_id",
@@ -45,19 +60,123 @@ object JsonSanitizer {
     )
 
     fun extractJsonArrayText(rawOutput: String): String {
-        val cleaned = rawOutput
+        val withoutThink = rawOutput
             .replace(THINK_BLOCK_REGEX, "")
             .replace(UNCLOSED_THINK_REGEX, "")
-            .replace(CODE_FENCE_START, "")
-            .replace(CODE_FENCE_END, "")
             .trim()
 
-        val firstBracket = cleaned.indexOf('[')
-        if (firstBracket == -1) {
-            throw MalformedSceneJsonException("No JSON array brackets found in LLM response")
+        val fencedMatches = FENCED_CODE_BLOCK_REGEX.findAll(withoutThink)
+            .map { it.groupValues[1].trim() }
+            .filter { it.contains('[') || it.contains('{') }
+            .toList()
+
+        val preferredFence = fencedMatches.firstOrNull { it.contains("scene_id") }
+            ?: fencedMatches.firstOrNull { it.contains('[') }
+            ?: fencedMatches.firstOrNull()
+
+        val cleaned = (preferredFence ?: withoutThink
+            .replace(CODE_FENCE_START, "")
+            .replace(CODE_FENCE_END, ""))
+            .trim()
+
+        val arrayStart = findTargetArrayStart(cleaned)
+        if (arrayStart == -1) {
+            throw MalformedSceneJsonException(
+                "No JSON array brackets found. Raw LLM output: ${rawOutput.take(220)}"
+            )
         }
 
-        return repairOrExtractArray(cleaned, firstBracket)
+        return repairOrExtractArray(cleaned, arrayStart, rawOutput)
+    }
+
+    /**
+     * Locates the opening `[` of the scene JSON array in pure Kotlin:
+     * 1. If the LLM returned an object wrapper (e.g. `{"scenes": [...]}`, `{"storyboard": [...]}`),
+     *    finds the matching wrapper array property `[` directly.
+     * 2. Otherwise prefers the first `[` outside strings whose next non-whitespace token is `{` (`[{...}]`),
+     *    skipping stray prose tags like `[Hook]` or `"tags": ["a"]`.
+     * 3. Falls back to the first `[` outside strings if present.
+     */
+    private fun findTargetArrayStart(cleaned: String): Int {
+        var inString = false
+        var escaped = false
+        var stringStart = -1
+        var lastStringValue: String? = null
+        var sawColonAfterKey = false
+
+        var firstWrapperArrayStart = -1
+        var firstObjectArrayStart = -1
+        var firstAnyArrayStart = -1
+
+        var i = 0
+        while (i < cleaned.length) {
+            val ch = cleaned[i]
+            if (inString) {
+                if (escaped) {
+                    escaped = false
+                } else if (ch == '\\') {
+                    escaped = true
+                } else if (ch == '"') {
+                    inString = false
+                    if (stringStart >= 0 && i > stringStart) {
+                        lastStringValue = cleaned.substring(stringStart + 1, i)
+                        sawColonAfterKey = false
+                    }
+                }
+                i++
+                continue
+            }
+
+            when {
+                ch == '"' -> {
+                    inString = true
+                    stringStart = i
+                }
+                ch == ':' -> {
+                    if (lastStringValue != null) {
+                        sawColonAfterKey = true
+                    }
+                }
+                ch == '[' -> {
+                    if (firstAnyArrayStart == -1) {
+                        firstAnyArrayStart = i
+                    }
+                    val nextNonWs = nextNonWhitespaceChar(cleaned, i + 1)
+                    val isObjectArray = nextNonWs == '{'
+                    if (isObjectArray && firstObjectArrayStart == -1) {
+                        firstObjectArrayStart = i
+                    }
+                    if (sawColonAfterKey &&
+                        lastStringValue != null &&
+                        lastStringValue.trim().lowercase() in WRAPPER_ARRAY_KEYS &&
+                        firstWrapperArrayStart == -1
+                    ) {
+                        firstWrapperArrayStart = i
+                    }
+                    sawColonAfterKey = false
+                    lastStringValue = null
+                }
+                !ch.isWhitespace() -> {
+                    sawColonAfterKey = false
+                    lastStringValue = null
+                }
+            }
+            i++
+        }
+
+        return when {
+            firstWrapperArrayStart != -1 -> firstWrapperArrayStart
+            firstObjectArrayStart != -1 -> firstObjectArrayStart
+            else -> firstAnyArrayStart
+        }
+    }
+
+    private fun nextNonWhitespaceChar(text: String, startIndex: Int): Char? {
+        for (idx in startIndex until text.length) {
+            val c = text[idx]
+            if (!c.isWhitespace()) return c
+        }
+        return null
     }
 
     /**
@@ -67,7 +186,7 @@ object JsonSanitizer {
      *   closed top-level scene object (`}` where `braceDepth == 0` and `bracketDepth == 1`),
      *   trims any incomplete trailing partial object and trailing commas, and closes with `]`.
      */
-    private fun repairOrExtractArray(cleaned: String, firstBracket: Int): String {
+    private fun repairOrExtractArray(cleaned: String, firstBracket: Int, rawOutput: String): String {
         var inString = false
         var escaped = false
         var braceDepth = 0
@@ -120,7 +239,9 @@ object JsonSanitizer {
             return "$repairedPrefix]"
         }
 
-        throw MalformedSceneJsonException("No complete scene objects or closing bracket found in LLM response")
+        throw MalformedSceneJsonException(
+            "No JSON array brackets found. Raw LLM output: ${rawOutput.take(220)}"
+        )
     }
 
     private fun stripTrailingCommasBeforeArrayEnd(jsonArrayText: String): String {

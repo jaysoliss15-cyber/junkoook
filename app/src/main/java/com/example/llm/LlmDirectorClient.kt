@@ -63,6 +63,11 @@ data class LlmScriptResult(
     val providerUsed: String
 )
 
+data class OpenAiChoiceResult(
+    val content: String,
+    val reasoningContent: String
+)
+
 class LlmHttpException(
     val statusCode: Int,
     val endpointUrl: String,
@@ -176,7 +181,7 @@ class LlmDirectorClient(
 
         for (attempt in 1..3) { // initial + up to 2 retries ONLY on malformed JSON / failed quality gate
             try {
-                // PASS 1: Beat-by-Beat Narrative Blueprint
+                // PASS 1: Beat-by-Beat Narrative Blueprint (plain text ONLY — never parsed via JsonSanitizer)
                 if (cachedBlueprint.isNullOrBlank()) {
                     onStatus("Pass 1/2: Planning ${durationBudget.targetSceneCount}-beat narrative blueprint via $providerName...")
                     val blueprintSystem = buildBlueprintSystemPrompt(activeCreativePrompt)
@@ -186,22 +191,28 @@ class LlmDirectorClient(
                         style = style,
                         budget = durationBudget
                     )
-                    cachedBlueprint = executeOpenAiChatCompletion(
-                        url = url,
-                        model = model,
-                        apiKey = apiKey,
-                        systemPrompt = blueprintSystem,
-                        userPrompt = blueprintUser,
-                        extraHeaders = extraHeaders
+                    cachedBlueprint = stripThinkingBlocks(
+                        executeOpenAiChatCompletion(
+                            url = url,
+                            model = model,
+                            apiKey = apiKey,
+                            systemPrompt = blueprintSystem,
+                            userPrompt = blueprintUser,
+                            extraHeaders = extraHeaders
+                        )
                     )
                 }
 
-                // PASS 2: Granular Scene Production
+                // PASS 2: Granular Scene Production (strict JSON array)
                 onStatus("Pass 2/2: Producing dense scenes via $providerName (try $attempt/3)...")
                 val retryHint = if (attempt > 1) {
-                    "\nCRITICAL: Previous output failed JSON/quality validation (${lastJsonError?.message ?: "error"}). Output ONLY a raw JSON array starting with '[' and ending with ']' satisfying every word-count, visual_description, and non-repetition requirement."
+                    "Previous output failed JSON/quality validation (${lastJsonError?.message ?: "error"}). Fix all issues immediately."
                 } else ""
 
+                val pass2SystemPrompt = buildPass2SystemPrompt(
+                    composedSystemPrompt = systemPrompt,
+                    retryHint = retryHint
+                )
                 val sceneUserPrompt = buildSceneProductionPrompt(
                     topic = topic,
                     durationSeconds = durationSeconds,
@@ -214,7 +225,7 @@ class LlmDirectorClient(
                     url = url,
                     model = model,
                     apiKey = apiKey,
-                    systemPrompt = systemPrompt + retryHint,
+                    systemPrompt = pass2SystemPrompt,
                     userPrompt = sceneUserPrompt,
                     extraHeaders = extraHeaders
                 )
@@ -230,7 +241,7 @@ class LlmDirectorClient(
                         url = url,
                         model = model,
                         apiKey = apiKey,
-                        systemPrompt = systemPrompt,
+                        systemPrompt = buildPass2SystemPrompt(systemPrompt),
                         userPrompt = repairUserPrompt,
                         extraHeaders = extraHeaders
                     )
@@ -315,13 +326,63 @@ class LlmDirectorClient(
         userPrompt: String,
         extraHeaders: Map<String, String>
     ): String {
+        val (firstChoice, firstBody) = performSingleOpenAiChatCompletion(
+            url = url,
+            model = model,
+            apiKey = apiKey,
+            systemPrompt = systemPrompt,
+            userPrompt = userPrompt,
+            extraHeaders = extraHeaders,
+            temperature = DEFAULT_TEMPERATURE
+        )
+        if (firstChoice.content.isNotBlank()) {
+            return firstChoice.content
+        }
+
+        // Reasoning models (e.g., DeepSeek R1 / Qwen) can exhaust tokens inside reasoning_content leaving message.content empty.
+        if (shouldRetryReasoningFallback(firstChoice.content, firstChoice.reasoningContent, DEFAULT_TEMPERATURE)) {
+            val (retryChoice, retryBody) = performSingleOpenAiChatCompletion(
+                url = url,
+                model = model,
+                apiKey = apiKey,
+                systemPrompt = systemPrompt,
+                userPrompt = userPrompt,
+                extraHeaders = extraHeaders,
+                temperature = REASONING_RETRY_TEMPERATURE
+            )
+            if (retryChoice.content.isNotBlank()) {
+                return retryChoice.content
+            }
+            val strippedReasoning = stripThinkingBlocks(retryChoice.reasoningContent)
+            if (strippedReasoning.isNotBlank()) {
+                return strippedReasoning
+            }
+            throw IOException(
+                "Empty completion content after temperature=$REASONING_RETRY_TEMPERATURE reasoning retry | URL: ${url.trim()} | Model: ${UniversalModelDetector.cleanCredential(model)} | Body: ${retryBody.take(300)}"
+            )
+        }
+
+        throw IOException(
+            "Empty completion content | URL: ${url.trim()} | Model: ${UniversalModelDetector.cleanCredential(model)} | Body: ${firstBody.take(300)}"
+        )
+    }
+
+    private fun performSingleOpenAiChatCompletion(
+        url: String,
+        model: String,
+        apiKey: String,
+        systemPrompt: String,
+        userPrompt: String,
+        extraHeaders: Map<String, String>,
+        temperature: Double
+    ): Pair<OpenAiChoiceResult, String> {
         val cleanKey = UniversalModelDetector.cleanCredential(apiKey)
         val cleanModel = UniversalModelDetector.cleanCredential(model)
         val cleanUrl = url.trim()
 
         val payload = JSONObject().apply {
             put("model", cleanModel)
-            put("temperature", 0.7)
+            put("temperature", temperature)
             put("max_tokens", MAX_TOKENS)
             put("messages", JSONArray().apply {
                 put(JSONObject().apply {
@@ -353,16 +414,7 @@ class LlmDirectorClient(
                     rawBody = bodyStr.ifBlank { "<empty body>" }
                 )
             }
-            val root = JSONObject(bodyStr)
-            val content = root.optJSONArray("choices")
-                ?.optJSONObject(0)
-                ?.optJSONObject("message")
-                ?.optString("content", "")
-                .orEmpty()
-            if (content.isBlank()) {
-                throw IOException("Empty completion content | URL: $cleanUrl | Model: $cleanModel | Body: ${bodyStr.take(300)}")
-            }
-            content
+            parseOpenAiChoiceResult(bodyStr) to bodyStr
         }
     }
 
@@ -371,6 +423,11 @@ class LlmDirectorClient(
         const val READ_TIMEOUT_SEC = 90L
         const val WRITE_TIMEOUT_SEC = 30L
         const val MAX_TOKENS = 4096
+        const val DEFAULT_TEMPERATURE = 0.7
+        const val REASONING_RETRY_TEMPERATURE = 0.4
+
+        const val STRICT_JSON_OUTPUT_FOOTER =
+            "CRITICAL OUTPUT FORMAT: Return ONLY a raw JSON array starting with [ and ending with ], with zero markdown fences or commentary"
 
         const val TAGALOG_CHARS_PER_SECOND = 15.5
         const val SCENE_PAUSE_SEC = 0.45
@@ -381,6 +438,44 @@ class LlmDirectorClient(
         const val MIN_WORDS_PER_VISUAL_DESCRIPTION = 18
         const val MIN_SPOKEN_CHAR_RATIO = 0.94
         const val MAX_REPAIR_PASSES = 2
+
+        private val THINK_BLOCK_REGEX = Regex("<think>[\\s\\S]*?</think>", RegexOption.IGNORE_CASE)
+        private val UNCLOSED_THINK_REGEX = Regex("<think>[\\s\\S]*$", RegexOption.IGNORE_CASE)
+
+        fun stripThinkingBlocks(raw: String): String =
+            raw.replace(THINK_BLOCK_REGEX, "")
+                .replace(UNCLOSED_THINK_REGEX, "")
+                .trim()
+
+        fun shouldRetryReasoningFallback(
+            cleanedContent: String,
+            reasoningContent: String,
+            currentTemperature: Double
+        ): Boolean = cleanedContent.isBlank() &&
+            reasoningContent.isNotBlank() &&
+            currentTemperature > REASONING_RETRY_TEMPERATURE
+
+        fun parseOpenAiChoiceResult(bodyStr: String): OpenAiChoiceResult {
+            val root = try {
+                JSONObject(bodyStr)
+            } catch (e: Exception) {
+                throw IOException("Invalid LLM JSON response envelope | Raw body: ${bodyStr.take(220)}", e)
+            }
+            val msg = root.optJSONArray("choices")
+                ?.optJSONObject(0)
+                ?.optJSONObject("message")
+            val rawContent = if (msg == null || msg.isNull("content")) "" else msg.optString("content", "")
+            val rawReasoning = when {
+                msg == null -> ""
+                !msg.isNull("reasoning_content") -> msg.optString("reasoning_content", "")
+                !msg.isNull("reasoning") -> msg.optString("reasoning", "")
+                else -> ""
+            }
+            return OpenAiChoiceResult(
+                content = stripThinkingBlocks(rawContent),
+                reasoningContent = rawReasoning.trim()
+            )
+        }
 
         private val VAGUE_ETC_REGEX = Regex("\\betc\\b\\.?", RegexOption.IGNORE_CASE)
         private val VISUAL_SUBJECT_ACTION_CUES = listOf(
@@ -445,7 +540,21 @@ MANDATORY DURATION & LENGTH CONTRACT:
 $safeCreative
 
 You are in PASS 1 (Beat-by-Beat Narrative Blueprinting). Plan every scene cleanly before JSON production so there is zero laziness or token fatigue in later scenes.
+PASS 1 PLAIN TEXT ONLY: Ignore any JSON output instructions during Pass 1. Output ONLY a numbered plain-text beat-by-beat narrative outline.
             """.trimIndent()
+        }
+
+        fun buildPass2SystemPrompt(
+            composedSystemPrompt: String,
+            retryHint: String = ""
+        ): String = buildString {
+            append(composedSystemPrompt.trim())
+            if (retryHint.isNotBlank()) {
+                append("\n\n")
+                append(retryHint.trim())
+            }
+            append("\n\n")
+            append(STRICT_JSON_OUTPUT_FOOTER)
         }
 
         fun buildNarrativeBlueprintPrompt(
@@ -468,7 +577,7 @@ Lock all of the following for EACH scene 1..${budget.targetSceneCount}:
 3. Distinct Visual Plan (main subject & action/pose, facial expression & hand prop, foreground/background environment, lighting/atmosphere).
 4. Planned non-repeating camera_motion, character_pose, and shot_framing so consecutive scenes NEVER repeat the same framing/pose/camera.
 
-Output the concise numbered blueprint now.
+Output ONLY the numbered plain-text outline now (do NOT output JSON in Pass 1).
             """.trimIndent()
         }
 
@@ -492,7 +601,8 @@ Output the concise numbered blueprint now.
                 append("- Consecutive scenes MUST NOT repeat the same camera_motion, character_pose, or shot_framing (never use STATIC).\n")
                 append("- TOPIC-FIRST RULE: Derive 100% of characters, wardrobe, environment_theme, props, cutaway_diagram_prompt, and diagrams strictly from the Topic & Blueprint.\n\n")
                 append(buildDurationContractBlock(budget))
-                append("\n\nOutput ONLY the valid JSON array of ${budget.targetSceneCount} scenes now.")
+                append("\n\nProduce all ${budget.targetSceneCount} scenes now.\n")
+                append(STRICT_JSON_OUTPUT_FOOTER)
             }
         }
 
@@ -537,7 +647,8 @@ Output the concise numbered blueprint now.
                 append("- \"tagalog_narration\": >= $MIN_WORDS_PER_NARRATION words and >= $MIN_CHARS_PER_NARRATION chars of natural Tagalog.\n")
                 append("- \"visual_description\": >= $MIN_WORDS_PER_VISUAL_DESCRIPTION words explicitly covering (1) main subject & exact action/pose, (2) facial expression & hand prop, (3) specific environment/foreground/background elements, (4) lighting/atmosphere; zero 'generic', 'simple background', or 'etc'.\n")
                 append("- Valid non-STATIC \"camera_motion\", explicit \"character_pose\", and explicit \"shot_framing\" distinct from adjacent scenes.\n")
-                append("\nReturn ONLY a JSON array containing ONLY scene_id(s): ${targetSceneIds.joinToString(", ")}.")
+                append("\nInclude ONLY scene_id(s): ${targetSceneIds.joinToString(", ")}.\n")
+                append(STRICT_JSON_OUTPUT_FOOTER)
             }
         }
 
