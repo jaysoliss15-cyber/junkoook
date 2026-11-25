@@ -10,6 +10,7 @@ import com.example.llm.LlmDirectorClient
 import com.example.llm.LlmHttpException
 import com.example.llm.LlmProviderPreset
 import com.example.llm.MalformedSceneJsonException
+import com.example.llm.SceneBatchRange
 import com.example.llm.TagalogNarrationValidator
 import com.example.llm.UniversalModelDetector
 import com.example.tts.ElevenLabsClient
@@ -1462,17 +1463,94 @@ class ToonForgeCoreTest {
         )
         assertTrue(repairUser.endsWith(expectedFooter))
 
-        // 5. HTTP 400 response_format fallback detection & reasoning model retry logic
+        // 5. HTTP 400 response_format & reasoning_effort fallback detection, temp 0.6, and batching
         assertTrue(LlmDirectorClient.isUnsupportedResponseFormatError(400, "{\"error\":\"Unsupported parameter: response_format\"}"))
         assertTrue(LlmDirectorClient.isUnsupportedResponseFormatError(400, "json_object mode not supported by this model"))
         assertFalse(LlmDirectorClient.isUnsupportedResponseFormatError(401, "Invalid response_format"))
         assertFalse(LlmDirectorClient.isUnsupportedResponseFormatError(400, "{\"error\":\"Invalid API key\"}"))
 
-        assertEquals(0.7, LlmDirectorClient.DEFAULT_TEMPERATURE, 0.001)
-        assertEquals(0.4, LlmDirectorClient.REASONING_RETRY_TEMPERATURE, 0.001)
-        assertTrue(LlmDirectorClient.shouldRetryReasoningFallback("", "Thinking step 1...", 0.7))
-        assertFalse(LlmDirectorClient.shouldRetryReasoningFallback("", "Thinking step 1...", 0.4))
-        assertFalse(LlmDirectorClient.shouldRetryReasoningFallback("[{\"scene_id\":1}]", "Thinking step 1...", 0.7))
+        assertTrue(LlmDirectorClient.isUnsupportedReasoningEffortError(400, "{\"error\":\"Unknown parameter: 'reasoning_effort'\"}"))
+        assertTrue(LlmDirectorClient.isUnsupportedReasoningEffortError(400, "reasoning effort is not supported for this model"))
+        assertFalse(LlmDirectorClient.isUnsupportedReasoningEffortError(401, "reasoning_effort unsupported"))
+        assertFalse(LlmDirectorClient.isUnsupportedReasoningEffortError(400, "{\"error\":\"Invalid API key\"}"))
+
+        assertEquals(0.6, LlmDirectorClient.DEFAULT_TEMPERATURE, 0.001)
+        assertEquals("low", LlmDirectorClient.DEFAULT_REASONING_EFFORT)
+        assertEquals(5, LlmDirectorClient.MAX_SCENES_PER_BATCH)
+        assertEquals(3, LlmDirectorClient.FALLBACK_SCENES_PER_BATCH)
         assertEquals("[{\"scene_id\":1}]", LlmDirectorClient.stripThinkingBlocks("<think>internal</think>\n[{\"scene_id\":1}]"))
+        assertTrue(LlmDirectorClient.hasJsonArrayBrackets("{\"scenes\": [{\"scene_id\": 1}]}"))
+        assertFalse(LlmDirectorClient.hasJsonArrayBrackets("Plain planning notes without array brackets"))
+
+        // Batching for 60s-90s videos (12-20 scenes): max 5 scenes per request
+        val batches13 = LlmDirectorClient.computeSceneBatches(13)
+        assertEquals(
+            listOf(SceneBatchRange(1, 5), SceneBatchRange(6, 10), SceneBatchRange(11, 13)),
+            batches13
+        )
+        val batches20 = LlmDirectorClient.computeSceneBatches(20)
+        assertEquals(4, batches20.size)
+        assertTrue(batches20.all { it.count in 1..5 })
+        assertEquals(listOf(SceneBatchRange(1, 5)), LlmDirectorClient.computeSceneBatches(5))
+
+        // Smaller sub-batch splitting (max 3 scenes) on empty/non-JSON fallback retry
+        assertEquals(
+            listOf(SceneBatchRange(6, 8), SceneBatchRange(9, 10)),
+            LlmDirectorClient.splitBatchRange(SceneBatchRange(6, 10))
+        )
+
+        // Batch scene ID alignment when LLM re-numbers batch 6..10 starting from 1
+        val renumberedBatch = (1..5).map { idx ->
+            SceneScript(
+                sceneId = idx,
+                tagalogNarration = "Bahagi $idx ng kuwento tungkol sa tamang pag-iipon ng pera sa araw-araw.",
+                visualDescription = "Filipino worker smiling holding a blue ledger beside a wooden desk inside a sunny room.",
+                backgroundPrompt = "sunny room",
+                cameraMotion = CameraMotion.PAN_RIGHT,
+                actorRole = ActorRole.HERO,
+                actorAction = ActorAction.TALK_BOUNCE,
+                worldFx = WorldFx.NONE
+            )
+        }
+        val aligned = LlmDirectorClient.alignBatchSceneIds(renumberedBatch, SceneBatchRange(6, 10))
+        assertEquals(listOf(6, 7, 8, 9, 10), aligned.map { it.sceneId })
+
+        // 2-sentence continuity summary for subsequent batch
+        val continuity = LlmDirectorClient.summarizeBatchContinuity(aligned)
+        assertTrue(continuity.contains("Scenes 6-10"))
+        assertTrue(continuity.contains("PAN_RIGHT"))
+        assertEquals(2, continuity.count { it == '.' })
+
+        // Raw array retry prompt places exact directive at very end
+        val budget90 = LlmDirectorClient.calculateDurationBudget(90)
+        val batchPromptJson = LlmDirectorClient.buildBatchSceneProductionPrompt(
+            topic = "Emergency Fund",
+            durationSeconds = 90,
+            style = AnimationStyle.FLAT_VECTOR,
+            budget = budget90,
+            blueprint = "1. Hook\n6. Middle",
+            batchRange = SceneBatchRange(6, 10),
+            previousBatchSummary = continuity,
+            forceRawArrayOnly = false
+        )
+        assertTrue(batchPromptJson.contains("Scenes 6..10"))
+        assertTrue(batchPromptJson.contains(continuity))
+        assertTrue(batchPromptJson.endsWith(LlmDirectorClient.STRICT_JSON_OUTPUT_FOOTER))
+
+        val batchPromptRawRetry = LlmDirectorClient.buildBatchSceneProductionPrompt(
+            topic = "Emergency Fund",
+            durationSeconds = 90,
+            style = AnimationStyle.FLAT_VECTOR,
+            budget = budget90,
+            blueprint = "1. Hook\n6. Middle",
+            batchRange = SceneBatchRange(6, 8),
+            previousBatchSummary = continuity,
+            forceRawArrayOnly = true
+        )
+        assertTrue(
+            batchPromptRawRetry.endsWith(
+                "Respond ONLY with the raw JSON array starting with [ and ending with ]. Do not output planning notes."
+            )
+        )
     }
 }

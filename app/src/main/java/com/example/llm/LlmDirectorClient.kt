@@ -65,8 +65,15 @@ data class LlmScriptResult(
 
 data class OpenAiChoiceResult(
     val content: String,
-    val reasoningContent: String
+    val reasoningContent: String = ""
 )
+
+data class SceneBatchRange(
+    val startSceneId: Int,
+    val endSceneId: Int
+) {
+    val count: Int get() = (endSceneId - startSceneId + 1).coerceAtLeast(0)
+}
 
 class LlmHttpException(
     val statusCode: Int,
@@ -191,62 +198,83 @@ class LlmDirectorClient(
                         style = style,
                         budget = durationBudget
                     )
-                    cachedBlueprint = stripThinkingBlocks(
-                        executeOpenAiChatCompletion(
-                            url = url,
-                            model = model,
-                            apiKey = apiKey,
-                            systemPrompt = blueprintSystem,
-                            userPrompt = blueprintUser,
-                            extraHeaders = extraHeaders,
-                            useJsonObjectMode = false
+                    cachedBlueprint = try {
+                        stripThinkingBlocks(
+                            executeOpenAiChatCompletion(
+                                url = url,
+                                model = model,
+                                apiKey = apiKey,
+                                systemPrompt = blueprintSystem,
+                                userPrompt = blueprintUser,
+                                extraHeaders = extraHeaders,
+                                useJsonObjectMode = false
+                            )
                         )
-                    )
+                    } catch (_: MalformedSceneJsonException) {
+                        stripThinkingBlocks(
+                            executeOpenAiChatCompletion(
+                                url = url,
+                                model = model,
+                                apiKey = apiKey,
+                                systemPrompt = "$blueprintSystem\nOutput the numbered outline directly in message content with zero long preamble.",
+                                userPrompt = blueprintUser,
+                                extraHeaders = extraHeaders,
+                                useJsonObjectMode = false
+                            )
+                        )
+                    }
                 }
 
-                // PASS 2: Granular Scene Production (structured JSON object {"scenes": [...]})
-                onStatus("Pass 2/2: Producing dense scenes via $providerName (try $attempt/3)...")
+                // PASS 2: Sequential Batched Scene Production (max 5 scenes per API call)
+                val batches = computeSceneBatches(durationBudget.targetSceneCount, MAX_SCENES_PER_BATCH)
+                val accumulatedScenes = mutableListOf<SceneScript>()
+                var previousBatchSummary = ""
                 val retryHint = if (attempt > 1) {
                     "Previous output failed JSON/quality validation (${lastJsonError?.message ?: "error"}). Fix all issues immediately."
                 } else ""
 
-                val pass2SystemPrompt = buildPass2SystemPrompt(
-                    composedSystemPrompt = systemPrompt,
-                    retryHint = retryHint
-                )
-                val sceneUserPrompt = buildSceneProductionPrompt(
-                    topic = topic,
-                    durationSeconds = durationSeconds,
-                    style = style,
-                    budget = durationBudget,
-                    blueprint = cachedBlueprint.orEmpty()
-                )
+                for (batchRange in batches) {
+                    onStatus(
+                        "Pass 2/2: Producing scenes ${batchRange.startSceneId}–${batchRange.endSceneId} of ${durationBudget.targetSceneCount} via $providerName (try $attempt/3)..."
+                    )
+                    val batchScenes = generateSceneBatchWithRetry(
+                        url = url,
+                        model = model,
+                        apiKey = apiKey,
+                        topic = topic,
+                        durationSeconds = durationSeconds,
+                        style = style,
+                        composedSystemPrompt = systemPrompt,
+                        retryHint = retryHint,
+                        budget = durationBudget,
+                        blueprint = cachedBlueprint.orEmpty(),
+                        batchRange = batchRange,
+                        previousBatchSummary = previousBatchSummary,
+                        extraHeaders = extraHeaders,
+                        onStatus = onStatus
+                    )
+                    accumulatedScenes.addAll(batchScenes)
+                    previousBatchSummary = summarizeBatchContinuity(batchScenes)
+                }
 
-                val rawText = executeOpenAiChatCompletion(
-                    url = url,
-                    model = model,
-                    apiKey = apiKey,
-                    systemPrompt = pass2SystemPrompt,
-                    userPrompt = sceneUserPrompt,
-                    extraHeaders = extraHeaders,
-                    useJsonObjectMode = true
-                )
-
-                val initialScenes = JsonSanitizer.parseAndValidateScenes(rawText)
                 val validatedScenes = validateScenesOrRepair(
-                    initialScenes = initialScenes,
+                    initialScenes = accumulatedScenes,
                     budget = durationBudget,
                     blueprint = cachedBlueprint.orEmpty(),
                     onStatus = onStatus
-                ) { repairUserPrompt ->
+                ) { repairUserPrompt, forceRawArrayOnly ->
                     executeOpenAiChatCompletion(
                         url = url,
                         model = model,
                         apiKey = apiKey,
-                        systemPrompt = buildPass2SystemPrompt(systemPrompt),
+                        systemPrompt = buildPass2SystemPrompt(
+                            composedSystemPrompt = systemPrompt,
+                            retryHint = if (forceRawArrayOnly) RAW_ARRAY_RETRY_DIRECTIVE else "",
+                            forceRawArrayOnly = forceRawArrayOnly
+                        ),
                         userPrompt = repairUserPrompt,
                         extraHeaders = extraHeaders,
-                        useJsonObjectMode = true
+                        useJsonObjectMode = !forceRawArrayOnly
                     )
                 }
                 return Result.success(LlmScriptResult(scenes = validatedScenes, providerUsed = providerName))
@@ -261,12 +289,104 @@ class LlmDirectorClient(
         return Result.failure(lastJsonError ?: IOException("Script quality gate failed after 3 attempts | URL: $url | Model: $model"))
     }
 
+    private suspend fun generateSceneBatchWithRetry(
+        url: String,
+        model: String,
+        apiKey: String,
+        topic: String,
+        durationSeconds: Int,
+        style: AnimationStyle,
+        composedSystemPrompt: String,
+        retryHint: String,
+        budget: DurationBudget,
+        blueprint: String,
+        batchRange: SceneBatchRange,
+        previousBatchSummary: String,
+        extraHeaders: Map<String, String>,
+        onStatus: (String) -> Unit
+    ): List<SceneScript> {
+        val primarySystem = buildPass2SystemPrompt(
+            composedSystemPrompt = composedSystemPrompt,
+            retryHint = retryHint,
+            forceRawArrayOnly = false
+        )
+        val primaryUser = buildBatchSceneProductionPrompt(
+            topic = topic,
+            durationSeconds = durationSeconds,
+            style = style,
+            budget = budget,
+            blueprint = blueprint,
+            batchRange = batchRange,
+            previousBatchSummary = previousBatchSummary,
+            forceRawArrayOnly = false
+        )
+
+        return try {
+            val rawText = executeOpenAiChatCompletion(
+                url = url,
+                model = model,
+                apiKey = apiKey,
+                systemPrompt = primarySystem,
+                userPrompt = primaryUser,
+                extraHeaders = extraHeaders,
+                useJsonObjectMode = true
+            )
+            val parsed = JsonSanitizer.parseAndValidateScenes(rawText)
+            alignBatchSceneIds(parsed, batchRange)
+        } catch (primaryErr: MalformedSceneJsonException) {
+            // message.content was empty or lacked valid JSON array brackets — split batch to <= 3 scenes and demand raw [ ... ]
+            val subBatches = splitBatchRange(batchRange, FALLBACK_SCENES_PER_BATCH)
+            val subResults = mutableListOf<SceneScript>()
+            var subPrevSummary = previousBatchSummary
+            val fallbackSystem = buildPass2SystemPrompt(
+                composedSystemPrompt = composedSystemPrompt,
+                retryHint = "Previous batch response lacked valid JSON scene objects (${primaryErr.message ?: "empty/prose"}). $RAW_ARRAY_RETRY_DIRECTIVE",
+                forceRawArrayOnly = true
+            )
+
+            for (subRange in subBatches) {
+                onStatus(
+                    "Pass 2/2: Retrying scenes ${subRange.startSceneId}–${subRange.endSceneId} in compact ${FALLBACK_SCENES_PER_BATCH}-scene raw JSON mode..."
+                )
+                val fallbackUser = buildBatchSceneProductionPrompt(
+                    topic = topic,
+                    durationSeconds = durationSeconds,
+                    style = style,
+                    budget = budget,
+                    blueprint = blueprint,
+                    batchRange = subRange,
+                    previousBatchSummary = subPrevSummary,
+                    forceRawArrayOnly = true
+                )
+                val retryRaw = executeOpenAiChatCompletion(
+                    url = url,
+                    model = model,
+                    apiKey = apiKey,
+                    systemPrompt = fallbackSystem,
+                    userPrompt = fallbackUser,
+                    extraHeaders = extraHeaders,
+                    useJsonObjectMode = false
+                )
+                if (!hasJsonArrayBrackets(retryRaw)) {
+                    throw MalformedSceneJsonException(
+                        "No JSON array brackets found after ${FALLBACK_SCENES_PER_BATCH}-scene fallback retry. Raw LLM output: ${retryRaw.trim().take(220)}"
+                    )
+                }
+                val parsedSub = JsonSanitizer.parseAndValidateScenes(retryRaw)
+                val alignedSub = alignBatchSceneIds(parsedSub, subRange)
+                subResults.addAll(alignedSub)
+                subPrevSummary = summarizeBatchContinuity(alignedSub)
+            }
+            subResults
+        }
+    }
+
     private suspend fun validateScenesOrRepair(
         initialScenes: List<SceneScript>,
         budget: DurationBudget,
         blueprint: String,
         onStatus: (String) -> Unit,
-        requestRepair: suspend (repairUserPrompt: String) -> String
+        requestRepair: suspend (repairUserPrompt: String, forceRawArrayOnly: Boolean) -> String
     ): List<SceneScript> {
         var working = initialScenes
             .sortedBy { it.sceneId }
@@ -289,21 +409,42 @@ class LlmDirectorClient(
                     .sorted()
             }
 
-            onStatus("Quality Gate Repair ($repairPass/$MAX_REPAIR_PASSES): Fixing scenes ${targetIds.joinToString(", ")}...")
-            val repairPrompt = buildTargetedRepairPrompt(
-                workingScenes = working,
-                targetSceneIds = targetIds,
-                report = report,
-                budget = budget,
-                blueprint = blueprint
-            )
-            val rawRepaired = requestRepair(repairPrompt)
-            val parsedRepaired = JsonSanitizer.parseAndValidateScenes(rawRepaired)
-            working = mergeRepairedScenes(
-                existing = working,
-                repaired = parsedRepaired,
-                targetSceneCount = budget.targetSceneCount
-            )
+            val repairBatches = targetIds.chunked(MAX_SCENES_PER_BATCH)
+            for (batchIds in repairBatches) {
+                onStatus("Quality Gate Repair ($repairPass/$MAX_REPAIR_PASSES): Fixing scenes ${batchIds.joinToString(", ")}...")
+                val repairedBatch = try {
+                    val repairPrompt = buildTargetedRepairPrompt(
+                        workingScenes = working,
+                        targetSceneIds = batchIds,
+                        report = report,
+                        budget = budget,
+                        blueprint = blueprint,
+                        forceRawArrayOnly = false
+                    )
+                    val rawRepaired = requestRepair(repairPrompt, false)
+                    JsonSanitizer.parseAndValidateScenes(rawRepaired)
+                } catch (_: MalformedSceneJsonException) {
+                    val smallRepairs = mutableListOf<SceneScript>()
+                    for (subIds in batchIds.chunked(FALLBACK_SCENES_PER_BATCH)) {
+                        val subPrompt = buildTargetedRepairPrompt(
+                            workingScenes = working,
+                            targetSceneIds = subIds,
+                            report = report,
+                            budget = budget,
+                            blueprint = blueprint,
+                            forceRawArrayOnly = true
+                        )
+                        val rawSub = requestRepair(subPrompt, true)
+                        smallRepairs.addAll(JsonSanitizer.parseAndValidateScenes(rawSub))
+                    }
+                    smallRepairs
+                }
+                working = mergeRepairedScenes(
+                    existing = working,
+                    repaired = repairedBatch,
+                    targetSceneCount = budget.targetSceneCount
+                )
+            }
         }
 
         val trimThreshold = (budget.maxChars * OVERSHOOT_TRIM_MULTIPLIER).roundToInt()
@@ -330,84 +471,39 @@ class LlmDirectorClient(
         extraHeaders: Map<String, String>,
         useJsonObjectMode: Boolean = false
     ): String {
-        return try {
-            executeWithReasoningRetry(
-                url = url,
-                model = model,
-                apiKey = apiKey,
-                systemPrompt = systemPrompt,
-                userPrompt = userPrompt,
-                extraHeaders = extraHeaders,
-                includeResponseFormat = useJsonObjectMode
-            )
-        } catch (e: LlmHttpException) {
-            // Some third-party OpenAI proxies reject response_format with HTTP 400; retry once without it.
-            if (useJsonObjectMode && isUnsupportedResponseFormatError(e.statusCode, e.rawBody)) {
-                executeWithReasoningRetry(
+        var includeResponseFormat = useJsonObjectMode
+        var includeReasoningEffort = true
+
+        while (true) {
+            try {
+                val (choice, rawBody) = performSingleOpenAiChatCompletion(
                     url = url,
                     model = model,
                     apiKey = apiKey,
                     systemPrompt = systemPrompt,
                     userPrompt = userPrompt,
                     extraHeaders = extraHeaders,
-                    includeResponseFormat = false
+                    temperature = DEFAULT_TEMPERATURE,
+                    includeResponseFormat = includeResponseFormat,
+                    includeReasoningEffort = includeReasoningEffort
                 )
-            } else {
+                if (choice.content.isNotBlank()) {
+                    return choice.content
+                }
+                throw MalformedSceneJsonException(
+                    "Empty message.content in LLM response (model may have exhausted tokens thinking) | URL: ${url.trim()} | Model: ${UniversalModelDetector.cleanCredential(model)} | Body: ${rawBody.take(220)}"
+                )
+            } catch (e: LlmHttpException) {
+                val badReasoning = includeReasoningEffort && isUnsupportedReasoningEffortError(e.statusCode, e.rawBody)
+                val badFormat = includeResponseFormat && isUnsupportedResponseFormatError(e.statusCode, e.rawBody)
+                if (badReasoning || badFormat) {
+                    if (badReasoning) includeReasoningEffort = false
+                    if (badFormat) includeResponseFormat = false
+                    continue
+                }
                 throw e
             }
         }
-    }
-
-    private fun executeWithReasoningRetry(
-        url: String,
-        model: String,
-        apiKey: String,
-        systemPrompt: String,
-        userPrompt: String,
-        extraHeaders: Map<String, String>,
-        includeResponseFormat: Boolean
-    ): String {
-        val (firstChoice, firstBody) = performSingleOpenAiChatCompletion(
-            url = url,
-            model = model,
-            apiKey = apiKey,
-            systemPrompt = systemPrompt,
-            userPrompt = userPrompt,
-            extraHeaders = extraHeaders,
-            temperature = DEFAULT_TEMPERATURE,
-            includeResponseFormat = includeResponseFormat
-        )
-        if (firstChoice.content.isNotBlank()) {
-            return firstChoice.content
-        }
-
-        // Reasoning models (e.g., DeepSeek R1 / Qwen) can exhaust tokens inside reasoning_content leaving message.content empty.
-        if (shouldRetryReasoningFallback(firstChoice.content, firstChoice.reasoningContent, DEFAULT_TEMPERATURE)) {
-            val (retryChoice, retryBody) = performSingleOpenAiChatCompletion(
-                url = url,
-                model = model,
-                apiKey = apiKey,
-                systemPrompt = systemPrompt,
-                userPrompt = userPrompt,
-                extraHeaders = extraHeaders,
-                temperature = REASONING_RETRY_TEMPERATURE,
-                includeResponseFormat = includeResponseFormat
-            )
-            if (retryChoice.content.isNotBlank()) {
-                return retryChoice.content
-            }
-            val strippedReasoning = stripThinkingBlocks(retryChoice.reasoningContent)
-            if (strippedReasoning.isNotBlank()) {
-                return strippedReasoning
-            }
-            throw IOException(
-                "Empty completion content after temperature=$REASONING_RETRY_TEMPERATURE reasoning retry | URL: ${url.trim()} | Model: ${UniversalModelDetector.cleanCredential(model)} | Body: ${retryBody.take(300)}"
-            )
-        }
-
-        throw IOException(
-            "Empty completion content | URL: ${url.trim()} | Model: ${UniversalModelDetector.cleanCredential(model)} | Body: ${firstBody.take(300)}"
-        )
     }
 
     private fun performSingleOpenAiChatCompletion(
@@ -418,7 +514,8 @@ class LlmDirectorClient(
         userPrompt: String,
         extraHeaders: Map<String, String>,
         temperature: Double,
-        includeResponseFormat: Boolean
+        includeResponseFormat: Boolean,
+        includeReasoningEffort: Boolean
     ): Pair<OpenAiChoiceResult, String> {
         val cleanKey = UniversalModelDetector.cleanCredential(apiKey)
         val cleanModel = UniversalModelDetector.cleanCredential(model)
@@ -428,6 +525,9 @@ class LlmDirectorClient(
             put("model", cleanModel)
             put("temperature", temperature)
             put("max_tokens", MAX_TOKENS)
+            if (includeReasoningEffort) {
+                put("reasoning_effort", DEFAULT_REASONING_EFFORT)
+            }
             if (includeResponseFormat) {
                 put("response_format", JSONObject().apply {
                     put("type", "json_object")
@@ -472,11 +572,15 @@ class LlmDirectorClient(
         const val READ_TIMEOUT_SEC = 90L
         const val WRITE_TIMEOUT_SEC = 30L
         const val MAX_TOKENS = 4096
-        const val DEFAULT_TEMPERATURE = 0.7
-        const val REASONING_RETRY_TEMPERATURE = 0.4
+        const val MAX_SCENES_PER_BATCH = 5
+        const val FALLBACK_SCENES_PER_BATCH = 3
+        const val DEFAULT_TEMPERATURE = 0.6
+        const val DEFAULT_REASONING_EFFORT = "low"
 
         const val STRICT_JSON_OUTPUT_FOOTER =
             "CRITICAL OUTPUT FORMAT: Return ONLY a raw JSON object {\"scenes\": [ ... ]} with zero markdown fences or commentary."
+        const val RAW_ARRAY_RETRY_DIRECTIVE =
+            "Respond ONLY with the raw JSON array starting with [ and ending with ]. Do not output planning notes."
 
         fun isUnsupportedResponseFormatError(statusCode: Int, rawBody: String): Boolean {
             if (statusCode != 400) return false
@@ -484,6 +588,103 @@ class LlmDirectorClient(
             return lower.contains("response_format") ||
                 lower.contains("json_object") ||
                 lower.contains("structured_outputs")
+        }
+
+        fun isUnsupportedReasoningEffortError(statusCode: Int, rawBody: String): Boolean {
+            if (statusCode != 400) return false
+            val lower = rawBody.lowercase()
+            return lower.contains("reasoning_effort") ||
+                (lower.contains("reasoning") && (
+                    lower.contains("unsupported") ||
+                        lower.contains("not supported") ||
+                        lower.contains("does not support") ||
+                        lower.contains("unknown") ||
+                        lower.contains("invalid") ||
+                        lower.contains("not allowed") ||
+                        lower.contains("unrecognized") ||
+                        lower.contains("extra inputs")
+                )) ||
+                (lower.contains("extra inputs are not permitted") && !lower.contains("response_format"))
+        }
+
+        fun hasJsonArrayBrackets(rawText: String): Boolean {
+            if (rawText.isBlank()) return false
+            val firstOpen = rawText.indexOf('[')
+            val lastClose = rawText.lastIndexOf(']')
+            return firstOpen >= 0 && lastClose > firstOpen
+        }
+
+        fun computeSceneBatches(
+            targetSceneCount: Int,
+            maxBatchSize: Int = MAX_SCENES_PER_BATCH
+        ): List<SceneBatchRange> {
+            if (targetSceneCount <= 0) return emptyList()
+            val safeBatchSize = maxBatchSize.coerceAtLeast(1)
+            val result = mutableListOf<SceneBatchRange>()
+            var start = 1
+            while (start <= targetSceneCount) {
+                val end = (start + safeBatchSize - 1).coerceAtMost(targetSceneCount)
+                result.add(SceneBatchRange(startSceneId = start, endSceneId = end))
+                start = end + 1
+            }
+            return result
+        }
+
+        fun splitBatchRange(
+            range: SceneBatchRange,
+            maxBatchSize: Int = FALLBACK_SCENES_PER_BATCH
+        ): List<SceneBatchRange> {
+            if (range.endSceneId < range.startSceneId) return emptyList()
+            val safeBatchSize = maxBatchSize.coerceAtLeast(1)
+            val result = mutableListOf<SceneBatchRange>()
+            var start = range.startSceneId
+            while (start <= range.endSceneId) {
+                val end = (start + safeBatchSize - 1).coerceAtMost(range.endSceneId)
+                result.add(SceneBatchRange(startSceneId = start, endSceneId = end))
+                start = end + 1
+            }
+            return result
+        }
+
+        fun alignBatchSceneIds(
+            parsed: List<SceneScript>,
+            batchRange: SceneBatchRange
+        ): List<SceneScript> {
+            if (parsed.isEmpty()) return emptyList()
+            val expectedRange = batchRange.startSceneId..batchRange.endSceneId
+            val distinctIds = parsed.map { it.sceneId }.distinct()
+            val alreadyAligned = parsed.all { it.sceneId in expectedRange } && distinctIds.size == parsed.size
+            if (alreadyAligned) {
+                return parsed.sortedBy { it.sceneId }
+            }
+            return parsed.mapIndexed { idx, scene ->
+                scene.copy(sceneId = batchRange.startSceneId + idx)
+            }
+        }
+
+        fun summarizeBatchContinuity(scenes: List<SceneScript>): String {
+            if (scenes.isEmpty()) return ""
+            val ordered = scenes.sortedBy { it.sceneId }
+            val first = ordered.first()
+            val last = ordered.last()
+            val cleanFirst = first.tagalogNarration
+                .trim()
+                .replace(Regex("[.!?]+"), ",")
+                .replace(Regex("\\s+"), " ")
+                .take(90)
+                .trimEnd(',', ' ')
+            val cleanLast = last.tagalogNarration
+                .trim()
+                .replace(Regex("[.!?]+"), ",")
+                .replace(Regex("\\s+"), " ")
+                .take(120)
+                .trimEnd(',', ' ')
+            val lastPose = effectiveCharacterPose(last)
+            val lastFraming = effectiveShotFraming(last)
+            val envLabel = last.environmentTheme?.name ?: "the established scene environment"
+            val sentence1 = "Scenes ${first.sceneId}-${last.sceneId} opened with \"$cleanFirst\" and ended on Scene ${last.sceneId} with \"$cleanLast\"."
+            val sentence2 = "Continue smoothly from Scene ${last.sceneId} in $envLabel while choosing a different camera_motion (not ${last.cameraMotion}), character_pose (not $lastPose), and shot_framing (not $lastFraming)."
+            return "$sentence1 $sentence2"
         }
 
         const val TAGALOG_CHARS_PER_SECOND = 15.5
@@ -504,14 +705,6 @@ class LlmDirectorClient(
                 .replace(UNCLOSED_THINK_REGEX, "")
                 .trim()
 
-        fun shouldRetryReasoningFallback(
-            cleanedContent: String,
-            reasoningContent: String,
-            currentTemperature: Double
-        ): Boolean = cleanedContent.isBlank() &&
-            reasoningContent.isNotBlank() &&
-            currentTemperature > REASONING_RETRY_TEMPERATURE
-
         fun parseOpenAiChoiceResult(bodyStr: String): OpenAiChoiceResult {
             val root = try {
                 JSONObject(bodyStr)
@@ -522,15 +715,10 @@ class LlmDirectorClient(
                 ?.optJSONObject(0)
                 ?.optJSONObject("message")
             val rawContent = if (msg == null || msg.isNull("content")) "" else msg.optString("content", "")
-            val rawReasoning = when {
-                msg == null -> ""
-                !msg.isNull("reasoning_content") -> msg.optString("reasoning_content", "")
-                !msg.isNull("reasoning") -> msg.optString("reasoning", "")
-                else -> ""
-            }
+            // Strictly read message.content only; ignore message.reasoning_content to avoid parsing chain-of-thought prose.
             return OpenAiChoiceResult(
                 content = stripThinkingBlocks(rawContent),
-                reasoningContent = rawReasoning.trim()
+                reasoningContent = ""
             )
         }
 
@@ -603,7 +791,8 @@ PASS 1 PLAIN TEXT ONLY: Ignore any JSON output instructions during Pass 1. Outpu
 
         fun buildPass2SystemPrompt(
             composedSystemPrompt: String,
-            retryHint: String = ""
+            retryHint: String = "",
+            forceRawArrayOnly: Boolean = false
         ): String = buildString {
             append(composedSystemPrompt.trim())
             if (retryHint.isNotBlank()) {
@@ -611,7 +800,7 @@ PASS 1 PLAIN TEXT ONLY: Ignore any JSON output instructions during Pass 1. Outpu
                 append(retryHint.trim())
             }
             append("\n\n")
-            append(STRICT_JSON_OUTPUT_FOOTER)
+            append(if (forceRawArrayOnly) RAW_ARRAY_RETRY_DIRECTIVE else STRICT_JSON_OUTPUT_FOOTER)
         }
 
         fun buildNarrativeBlueprintPrompt(
@@ -644,22 +833,65 @@ Output ONLY the numbered plain-text outline now (do NOT output JSON in Pass 1).
             style: AnimationStyle,
             budget: DurationBudget,
             blueprint: String
+        ): String = buildBatchSceneProductionPrompt(
+            topic = topic,
+            durationSeconds = durationSeconds,
+            style = style,
+            budget = budget,
+            blueprint = blueprint,
+            batchRange = SceneBatchRange(1, budget.targetSceneCount),
+            previousBatchSummary = "",
+            forceRawArrayOnly = false
+        )
+
+        fun buildBatchSceneProductionPrompt(
+            topic: String,
+            durationSeconds: Int,
+            style: AnimationStyle,
+            budget: DurationBudget,
+            blueprint: String,
+            batchRange: SceneBatchRange,
+            previousBatchSummary: String = "",
+            forceRawArrayOnly: Boolean = false
         ): String {
+            val isFullScript = batchRange.startSceneId == 1 && batchRange.endSceneId == budget.targetSceneCount
+            val batchTargetChars = ((budget.targetSpokenChars.toDouble() * batchRange.count) / budget.targetSceneCount.coerceAtLeast(1))
+                .roundToInt()
+                .coerceAtLeast(batchRange.count * MIN_CHARS_PER_NARRATION)
+            val batchMinChars = (batchTargetChars * 0.90).roundToInt()
+            val batchMaxChars = (batchTargetChars * 1.12).roundToInt()
+
             return buildString {
                 append("Topic: $topic\n")
                 append("Visual Rendering Style (aesthetic & camera feel ONLY—do NOT override story topic/characters): ${style.displayName}\n")
-                append("Target Duration: ${durationSeconds} seconds\n\n")
+                append("Target Full Video Duration: ${durationSeconds} seconds (${budget.targetSceneCount} total scenes)\n")
+                append("CURRENT BATCH SCOPE: Generate ONLY Scenes ${batchRange.startSceneId}..${batchRange.endSceneId} (${batchRange.count} scenes), using scene_id ${batchRange.startSceneId} through ${batchRange.endSceneId}.\n\n")
+                if (previousBatchSummary.isNotBlank()) {
+                    append("--- PREVIOUS BATCH CONTINUITY SUMMARY ---\n")
+                    append(previousBatchSummary.trim())
+                    append("\n\n")
+                }
                 append("--- LOCKED PASS 1 NARRATIVE BLUEPRINT ---\n")
                 append(blueprint.trim())
                 append("\n\n--- PASS 2 GRANULAR SCENE PRODUCTION RULES ---\n")
-                append("Expand EVERY beat 1..${budget.targetSceneCount} into full JSON scene objects with ZERO shortcuts:\n")
+                append("Expand beats ${batchRange.startSceneId}..${batchRange.endSceneId} into full JSON scene objects with ZERO shortcuts:\n")
                 append("- Every tagalog_narration MUST be natural conversational Filipino/Tagalog with >= $MIN_WORDS_PER_NARRATION words AND >= $MIN_CHARS_PER_NARRATION chars.\n")
                 append("- Every visual_description MUST have >= $MIN_WORDS_PER_VISUAL_DESCRIPTION vivid English words detailing (1) main subject & exact action/pose, (2) facial expression & hand prop, (3) specific environment/foreground/background elements, and (4) lighting/atmosphere. NEVER write 'generic', 'simple background', or 'etc'.\n")
                 append("- Consecutive scenes MUST NOT repeat the same camera_motion, character_pose, or shot_framing (never use STATIC).\n")
                 append("- TOPIC-FIRST RULE: Derive 100% of characters, wardrobe, environment_theme, props, cutaway_diagram_prompt, and diagrams strictly from the Topic & Blueprint.\n\n")
-                append(buildDurationContractBlock(budget))
-                append("\n\nProduce all ${budget.targetSceneCount} scenes inside {\"scenes\": [...]} now.\n")
-                append(STRICT_JSON_OUTPUT_FOOTER)
+                if (isFullScript) {
+                    append(buildDurationContractBlock(budget))
+                    append("\n\n")
+                } else {
+                    append("BATCH LENGTH BUDGET: Combined tagalog_narration across Scenes ${batchRange.startSceneId}..${batchRange.endSceneId} should be ~$batchTargetChars chars (between $batchMinChars and $batchMaxChars chars).\n\n")
+                }
+                if (forceRawArrayOnly) {
+                    append("Produce ONLY scenes ${batchRange.startSceneId}..${batchRange.endSceneId} (${batchRange.count} scene objects).\n")
+                    append(RAW_ARRAY_RETRY_DIRECTIVE)
+                } else {
+                    append("Produce ONLY scenes ${batchRange.startSceneId}..${batchRange.endSceneId} (${batchRange.count} scene objects) inside {\"scenes\": [...]}.\n")
+                    append(STRICT_JSON_OUTPUT_FOOTER)
+                }
             }
         }
 
@@ -668,7 +900,8 @@ Output ONLY the numbered plain-text outline now (do NOT output JSON in Pass 1).
             targetSceneIds: List<Int>,
             report: ScriptQualityReport,
             budget: DurationBudget,
-            blueprint: String
+            blueprint: String,
+            forceRawArrayOnly: Boolean = false
         ): String {
             val issueById = report.sceneIssues.associateBy { it.sceneId }
             val existingById = workingScenes.associateBy { it.sceneId }
@@ -704,8 +937,13 @@ Output ONLY the numbered plain-text outline now (do NOT output JSON in Pass 1).
                 append("- \"tagalog_narration\": >= $MIN_WORDS_PER_NARRATION words and >= $MIN_CHARS_PER_NARRATION chars of natural Tagalog.\n")
                 append("- \"visual_description\": >= $MIN_WORDS_PER_VISUAL_DESCRIPTION words explicitly covering (1) main subject & exact action/pose, (2) facial expression & hand prop, (3) specific environment/foreground/background elements, (4) lighting/atmosphere; zero 'generic', 'simple background', or 'etc'.\n")
                 append("- Valid non-STATIC \"camera_motion\", explicit \"character_pose\", and explicit \"shot_framing\" distinct from adjacent scenes.\n")
-                append("\nInclude ONLY scene_id(s): ${targetSceneIds.joinToString(", ")} inside {\"scenes\": [...]}.\n")
-                append(STRICT_JSON_OUTPUT_FOOTER)
+                if (forceRawArrayOnly) {
+                    append("\nInclude ONLY scene_id(s): ${targetSceneIds.joinToString(", ")}.\n")
+                    append(RAW_ARRAY_RETRY_DIRECTIVE)
+                } else {
+                    append("\nInclude ONLY scene_id(s): ${targetSceneIds.joinToString(", ")} inside {\"scenes\": [...]}.\n")
+                    append(STRICT_JSON_OUTPUT_FOOTER)
+                }
             }
         }
 
