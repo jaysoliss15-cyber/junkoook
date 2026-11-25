@@ -1116,8 +1116,9 @@ class ToonForgeCoreTest {
 
         // 2. LLM timeouts & max_tokens + exact HTTP error formatting
         assertEquals(30L, LlmDirectorClient.CONNECT_TIMEOUT_SEC)
-        assertEquals(90L, LlmDirectorClient.READ_TIMEOUT_SEC)
-        assertEquals(30L, LlmDirectorClient.WRITE_TIMEOUT_SEC)
+        assertEquals(180L, LlmDirectorClient.READ_TIMEOUT_SEC)
+        assertEquals(60L, LlmDirectorClient.WRITE_TIMEOUT_SEC)
+        assertEquals(240L, LlmDirectorClient.CALL_TIMEOUT_SEC)
         assertEquals(4096, LlmDirectorClient.MAX_TOKENS)
 
         val llmErr = LlmHttpException(
@@ -1487,6 +1488,17 @@ class ToonForgeCoreTest {
         assertFalse(afterFormat400.includeThinking)
         assertFalse(afterFormat400.includeEnableThinking)
         assertFalse(afterFormat400.includeResponseFormat)
+        assertTrue(afterFormat400.includeStream)
+
+        assertTrue(LlmDirectorClient.isUnsupportedStreamFieldError(400, "{\"error\":\"Unknown parameter: 'stream'\"}"))
+        assertTrue(LlmDirectorClient.isUnsupportedStreamFieldError(422, "streaming is not supported by this proxy"))
+        assertFalse(LlmDirectorClient.isUnsupportedStreamFieldError(401, "stream unsupported"))
+        val afterStream400 = LlmDirectorClient.nextCompatFlagsOnHttpError(
+            afterFormat400,
+            400,
+            "{\"error\":\"Unsupported parameter: 'stream'\"}"
+        )!!
+        assertFalse(afterStream400.includeStream)
         assertEquals(null, LlmDirectorClient.nextCompatFlagsOnHttpError(startFlags, 401, "Unauthorized"))
 
         assertEquals(0.6, LlmDirectorClient.DEFAULT_TEMPERATURE, 0.001)

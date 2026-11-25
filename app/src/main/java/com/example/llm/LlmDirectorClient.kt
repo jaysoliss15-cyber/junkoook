@@ -78,7 +78,8 @@ data class SceneBatchRange(
 data class ChatPayloadCompatFlags(
     val includeThinking: Boolean = true,
     val includeEnableThinking: Boolean = true,
-    val includeResponseFormat: Boolean = true
+    val includeResponseFormat: Boolean = true,
+    val includeStream: Boolean = true
 )
 
 class LlmHttpException(
@@ -93,6 +94,7 @@ class LlmDirectorClient(
         .connectTimeout(CONNECT_TIMEOUT_SEC, TimeUnit.SECONDS)
         .readTimeout(READ_TIMEOUT_SEC, TimeUnit.SECONDS)
         .writeTimeout(WRITE_TIMEOUT_SEC, TimeUnit.SECONDS)
+        .callTimeout(CALL_TIMEOUT_SEC, TimeUnit.SECONDS)
         .build()
 ) {
     private val jsonMediaType = "application/json; charset=utf-8".toMediaType()
@@ -413,7 +415,7 @@ class LlmDirectorClient(
     ): String {
         var compatFlags = ChatPayloadCompatFlags()
 
-        for (compatAttempt in 1..4) {
+        for (compatAttempt in 1..5) {
             try {
                 val (choice, rawBody) = performSingleOpenAiChatCompletion(
                     url = url,
@@ -433,7 +435,7 @@ class LlmDirectorClient(
                 )
             } catch (e: LlmHttpException) {
                 val nextFlags = nextCompatFlagsOnHttpError(compatFlags, e.statusCode, e.rawBody)
-                if (nextFlags != null && compatAttempt < 4) {
+                if (nextFlags != null && compatAttempt < 5) {
                     compatFlags = nextFlags
                     continue
                 }
@@ -461,6 +463,9 @@ class LlmDirectorClient(
             put("model", cleanModel)
             put("temperature", temperature)
             put("max_tokens", MAX_TOKENS)
+            if (compatFlags.includeStream) {
+                put("stream", true)
+            }
             if (compatFlags.includeThinking) {
                 put("thinking", JSONObject().apply {
                     put("type", "disabled")
@@ -486,17 +491,24 @@ class LlmDirectorClient(
             })
         }
 
+        val acceptHeader = if (compatFlags.includeStream) {
+            "text/event-stream, application/json"
+        } else {
+            "application/json"
+        }
+
         val reqBuilder = Request.Builder()
             .url(cleanUrl)
             .post(payload.toString().toRequestBody(jsonMediaType))
             .header("Content-Type", "application/json")
-            .header("Accept", "application/json")
+            .header("Accept", acceptHeader)
             .header("Authorization", "Bearer $cleanKey")
         extraHeaders.forEach { (k, v) -> reqBuilder.header(k, v) }
 
         return httpClient.newCall(reqBuilder.build()).execute().use { resp ->
-            val bodyStr = resp.body?.string().orEmpty()
+            val respBody = resp.body
             if (!resp.isSuccessful) {
+                val bodyStr = respBody?.string().orEmpty()
                 throw LlmHttpException(
                     statusCode = resp.code,
                     endpointUrl = cleanUrl,
@@ -504,14 +516,37 @@ class LlmDirectorClient(
                     rawBody = bodyStr.ifBlank { "<empty body>" }
                 )
             }
-            parseOpenAiChoiceResult(bodyStr) to bodyStr
+
+            if (respBody == null) {
+                throw IOException("Empty HTTP response body | URL: $cleanUrl | Model: $cleanModel")
+            }
+
+            val contentType = resp.header("Content-Type").orEmpty().lowercase()
+            if (contentType.contains("text/event-stream")) {
+                val rawSample = StringBuilder()
+                val choice = respBody.charStream().buffered().use { reader ->
+                    parseSseStreamLines(
+                        lines = generateSequence { reader.readLine() },
+                        rawCollector = rawSample
+                    )
+                }
+                choice to rawSample.toString()
+            } else {
+                val bodyStr = respBody.string()
+                if (!bodyStr.trimStart().startsWith("{") && bodyStr.contains("data:")) {
+                    parseSseStreamLines(bodyStr.lineSequence()) to bodyStr
+                } else {
+                    parseOpenAiChoiceResult(bodyStr) to bodyStr
+                }
+            }
         }
     }
 
     companion object {
         const val CONNECT_TIMEOUT_SEC = 30L
-        const val READ_TIMEOUT_SEC = 90L
-        const val WRITE_TIMEOUT_SEC = 30L
+        const val READ_TIMEOUT_SEC = 180L
+        const val WRITE_TIMEOUT_SEC = 60L
+        const val CALL_TIMEOUT_SEC = 240L
         const val MAX_TOKENS = 4096
         const val MAX_SCENES_PER_BATCH = 4
         const val FALLBACK_SCENES_PER_BATCH = 2
@@ -540,6 +575,16 @@ class LlmDirectorClient(
             return strippedEnableThinking.contains("thinking")
         }
 
+        fun isUnsupportedStreamFieldError(statusCode: Int, rawBody: String): Boolean {
+            if (statusCode != 400 && statusCode != 422) return false
+            val lower = rawBody.lowercase()
+            return lower.contains("\"stream\"") ||
+                lower.contains("'stream'") ||
+                lower.contains("stream is not supported") ||
+                lower.contains("streaming is not supported") ||
+                (lower.contains("stream") && (lower.contains("unsupported") || lower.contains("unknown") || lower.contains("invalid") || lower.contains("not allowed")))
+        }
+
         fun isGenericUnsupportedFieldError(statusCode: Int, rawBody: String): Boolean {
             if (statusCode != 400 && statusCode != 422) return false
             val lower = rawBody.lowercase()
@@ -558,26 +603,85 @@ class LlmDirectorClient(
             val badEnableThinking = current.includeEnableThinking && isUnsupportedEnableThinkingError(statusCode, rawBody)
             val badThinking = current.includeThinking && isUnsupportedThinkingFieldError(statusCode, rawBody)
             val badResponseFormat = current.includeResponseFormat && isUnsupportedResponseFormatError(statusCode, rawBody)
+            val badStream = current.includeStream && isUnsupportedStreamFieldError(statusCode, rawBody)
 
-            if (badEnableThinking || badThinking || badResponseFormat) {
+            if (badEnableThinking || badThinking || badResponseFormat || badStream) {
                 val next = current.copy(
                     includeThinking = current.includeThinking && !badThinking,
                     includeEnableThinking = current.includeEnableThinking && !badEnableThinking,
-                    includeResponseFormat = current.includeResponseFormat && !badResponseFormat
+                    includeResponseFormat = current.includeResponseFormat && !badResponseFormat,
+                    includeStream = current.includeStream && !badStream
                 )
                 return if (next != current) next else null
             }
 
             if (isGenericUnsupportedFieldError(statusCode, rawBody) &&
-                (current.includeThinking || current.includeEnableThinking || current.includeResponseFormat)
+                (current.includeThinking || current.includeEnableThinking || current.includeResponseFormat || current.includeStream)
             ) {
                 return ChatPayloadCompatFlags(
                     includeThinking = false,
                     includeEnableThinking = false,
-                    includeResponseFormat = false
+                    includeResponseFormat = false,
+                    includeStream = false
                 )
             }
             return null
+        }
+
+        fun parseSseStreamLines(
+            lines: Sequence<String>,
+            rawCollector: StringBuilder? = null
+        ): OpenAiChoiceResult {
+            val contentBuilder = StringBuilder()
+            var streamErrorMessage: String? = null
+
+            for (rawLine in lines) {
+                if (rawCollector != null && rawCollector.length < 2048) {
+                    rawCollector.append(rawLine).append('\n')
+                }
+                val trimmed = rawLine.trim()
+                if (trimmed.isEmpty() || trimmed.startsWith(":")) continue
+                if (!trimmed.startsWith("data:")) continue
+
+                val dataPayload = trimmed.removePrefix("data:").trim()
+                if (dataPayload == "[DONE]") break
+                if (!dataPayload.startsWith("{")) continue
+
+                val root = try {
+                    JSONObject(dataPayload)
+                } catch (_: Exception) {
+                    continue
+                }
+
+                val errObj = root.optJSONObject("error")
+                if (errObj != null) {
+                    streamErrorMessage = errObj.optString("message", "").ifBlank { errObj.toString() }
+                    continue
+                }
+
+                val choice0 = root.optJSONArray("choices")?.optJSONObject(0) ?: continue
+                val delta = choice0.optJSONObject("delta")
+                if (delta != null) {
+                    if (!delta.isNull("content")) {
+                        contentBuilder.append(delta.optString("content", ""))
+                    }
+                    // Strictly ignore delta.reasoning_content / delta.reasoning
+                } else {
+                    val message = choice0.optJSONObject("message")
+                    if (message != null && !message.isNull("content")) {
+                        contentBuilder.append(message.optString("content", ""))
+                    }
+                }
+            }
+
+            val cleaned = stripThinkingBlocks(contentBuilder.toString())
+            if (cleaned.isBlank() && !streamErrorMessage.isNullOrBlank()) {
+                throw IOException("LLM SSE stream error: $streamErrorMessage")
+            }
+            return OpenAiChoiceResult(
+                content = cleaned,
+                reasoningContent = ""
+            )
         }
 
         fun hasJsonArrayBrackets(rawText: String): Boolean {
