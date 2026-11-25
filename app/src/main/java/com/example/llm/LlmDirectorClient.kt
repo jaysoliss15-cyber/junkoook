@@ -75,6 +75,12 @@ data class SceneBatchRange(
     val count: Int get() = (endSceneId - startSceneId + 1).coerceAtLeast(0)
 }
 
+data class ChatPayloadCompatFlags(
+    val includeThinking: Boolean = true,
+    val includeEnableThinking: Boolean = true,
+    val includeResponseFormat: Boolean = true
+)
+
 class LlmHttpException(
     val statusCode: Int,
     val endpointUrl: String,
@@ -141,7 +147,7 @@ class LlmDirectorClient(
 
         var lastError: Throwable? = null
         for (url in candidateUrls) {
-            val result = tryTwoStageOpenAiPipeline(
+            val result = tryDirectBatchedJsonPipeline(
                 providerName = "$presetLabel ($resolvedModel)",
                 url = url,
                 model = resolvedModel,
@@ -149,7 +155,6 @@ class LlmDirectorClient(
                 topic = topic,
                 durationSeconds = durationSeconds,
                 style = style,
-                activeCreativePrompt = activeCreativePrompt,
                 systemPrompt = systemPrompt,
                 durationBudget = durationBudget,
                 extraHeaders = extraHeaders,
@@ -169,7 +174,7 @@ class LlmDirectorClient(
         throw (lastError ?: IOException("LLM request failed for URL: $primaryBaseUrl | Model: $resolvedModel"))
     }
 
-    private suspend fun tryTwoStageOpenAiPipeline(
+    private suspend fun tryDirectBatchedJsonPipeline(
         providerName: String,
         url: String,
         model: String,
@@ -177,65 +182,25 @@ class LlmDirectorClient(
         topic: String,
         durationSeconds: Int,
         style: AnimationStyle,
-        activeCreativePrompt: String,
         systemPrompt: String,
         durationBudget: DurationBudget,
         extraHeaders: Map<String, String> = emptyMap(),
         onStatus: (String) -> Unit
     ): Result<LlmScriptResult> {
         var lastJsonError: Throwable? = null
-        var cachedBlueprint: String? = null
 
         for (attempt in 1..3) { // initial + up to 2 retries ONLY on malformed JSON / failed quality gate
             try {
-                // PASS 1: Beat-by-Beat Narrative Blueprint (plain text ONLY — never parsed via JsonSanitizer)
-                if (cachedBlueprint.isNullOrBlank()) {
-                    onStatus("Pass 1/2: Planning ${durationBudget.targetSceneCount}-beat narrative blueprint via $providerName...")
-                    val blueprintSystem = buildBlueprintSystemPrompt(activeCreativePrompt)
-                    val blueprintUser = buildNarrativeBlueprintPrompt(
-                        topic = topic,
-                        durationSeconds = durationSeconds,
-                        style = style,
-                        budget = durationBudget
-                    )
-                    cachedBlueprint = try {
-                        stripThinkingBlocks(
-                            executeOpenAiChatCompletion(
-                                url = url,
-                                model = model,
-                                apiKey = apiKey,
-                                systemPrompt = blueprintSystem,
-                                userPrompt = blueprintUser,
-                                extraHeaders = extraHeaders,
-                                useJsonObjectMode = false
-                            )
-                        )
-                    } catch (_: MalformedSceneJsonException) {
-                        stripThinkingBlocks(
-                            executeOpenAiChatCompletion(
-                                url = url,
-                                model = model,
-                                apiKey = apiKey,
-                                systemPrompt = "$blueprintSystem\nOutput the numbered outline directly in message content with zero long preamble.",
-                                userPrompt = blueprintUser,
-                                extraHeaders = extraHeaders,
-                                useJsonObjectMode = false
-                            )
-                        )
-                    }
-                }
-
-                // PASS 2: Sequential Batched Scene Production (max 5 scenes per API call)
                 val batches = computeSceneBatches(durationBudget.targetSceneCount, MAX_SCENES_PER_BATCH)
                 val accumulatedScenes = mutableListOf<SceneScript>()
                 var previousBatchSummary = ""
                 val retryHint = if (attempt > 1) {
-                    "Previous output failed JSON/quality validation (${lastJsonError?.message ?: "error"}). Fix all issues immediately."
+                    "Previous json output failed validation (${lastJsonError?.message ?: "error"}). Fix all issues immediately."
                 } else ""
 
                 for (batchRange in batches) {
                     onStatus(
-                        "Pass 2/2: Producing scenes ${batchRange.startSceneId}–${batchRange.endSceneId} of ${durationBudget.targetSceneCount} via $providerName (try $attempt/3)..."
+                        "Generating scenes ${batchRange.startSceneId}–${batchRange.endSceneId} of ${durationBudget.targetSceneCount} via $providerName (try $attempt/3)..."
                     )
                     val batchScenes = generateSceneBatchWithRetry(
                         url = url,
@@ -247,7 +212,6 @@ class LlmDirectorClient(
                         composedSystemPrompt = systemPrompt,
                         retryHint = retryHint,
                         budget = durationBudget,
-                        blueprint = cachedBlueprint.orEmpty(),
                         batchRange = batchRange,
                         previousBatchSummary = previousBatchSummary,
                         extraHeaders = extraHeaders,
@@ -260,21 +224,17 @@ class LlmDirectorClient(
                 val validatedScenes = validateScenesOrRepair(
                     initialScenes = accumulatedScenes,
                     budget = durationBudget,
-                    blueprint = cachedBlueprint.orEmpty(),
                     onStatus = onStatus
-                ) { repairUserPrompt, forceRawArrayOnly ->
+                ) { repairUserPrompt ->
                     executeOpenAiChatCompletion(
                         url = url,
                         model = model,
                         apiKey = apiKey,
-                        systemPrompt = buildPass2SystemPrompt(
-                            composedSystemPrompt = systemPrompt,
-                            retryHint = if (forceRawArrayOnly) RAW_ARRAY_RETRY_DIRECTIVE else "",
-                            forceRawArrayOnly = forceRawArrayOnly
+                        systemPrompt = buildDirectorSystemPrompt(
+                            composedSystemPrompt = systemPrompt
                         ),
                         userPrompt = repairUserPrompt,
-                        extraHeaders = extraHeaders,
-                        useJsonObjectMode = !forceRawArrayOnly
+                        extraHeaders = extraHeaders
                     )
                 }
                 return Result.success(LlmScriptResult(scenes = validatedScenes, providerUsed = providerName))
@@ -299,26 +259,22 @@ class LlmDirectorClient(
         composedSystemPrompt: String,
         retryHint: String,
         budget: DurationBudget,
-        blueprint: String,
         batchRange: SceneBatchRange,
         previousBatchSummary: String,
         extraHeaders: Map<String, String>,
         onStatus: (String) -> Unit
     ): List<SceneScript> {
-        val primarySystem = buildPass2SystemPrompt(
+        val primarySystem = buildDirectorSystemPrompt(
             composedSystemPrompt = composedSystemPrompt,
-            retryHint = retryHint,
-            forceRawArrayOnly = false
+            retryHint = retryHint
         )
         val primaryUser = buildBatchSceneProductionPrompt(
             topic = topic,
             durationSeconds = durationSeconds,
             style = style,
             budget = budget,
-            blueprint = blueprint,
             batchRange = batchRange,
-            previousBatchSummary = previousBatchSummary,
-            forceRawArrayOnly = false
+            previousBatchSummary = previousBatchSummary
         )
 
         return try {
@@ -328,35 +284,31 @@ class LlmDirectorClient(
                 apiKey = apiKey,
                 systemPrompt = primarySystem,
                 userPrompt = primaryUser,
-                extraHeaders = extraHeaders,
-                useJsonObjectMode = true
+                extraHeaders = extraHeaders
             )
             val parsed = JsonSanitizer.parseAndValidateScenes(rawText)
             alignBatchSceneIds(parsed, batchRange)
         } catch (primaryErr: MalformedSceneJsonException) {
-            // message.content was empty or lacked valid JSON array brackets — split batch to <= 3 scenes and demand raw [ ... ]
+            // If a 4-scene batch failed JSON validation or returned empty content, split into <= 2-scene chunks
             val subBatches = splitBatchRange(batchRange, FALLBACK_SCENES_PER_BATCH)
             val subResults = mutableListOf<SceneScript>()
             var subPrevSummary = previousBatchSummary
-            val fallbackSystem = buildPass2SystemPrompt(
+            val fallbackSystem = buildDirectorSystemPrompt(
                 composedSystemPrompt = composedSystemPrompt,
-                retryHint = "Previous batch response lacked valid JSON scene objects (${primaryErr.message ?: "empty/prose"}). $RAW_ARRAY_RETRY_DIRECTIVE",
-                forceRawArrayOnly = true
+                retryHint = "Previous response failed json parsing (${primaryErr.message ?: "empty/prose"}). Return ONLY valid json {\"scenes\": [...]} with zero commentary."
             )
 
             for (subRange in subBatches) {
                 onStatus(
-                    "Pass 2/2: Retrying scenes ${subRange.startSceneId}–${subRange.endSceneId} in compact ${FALLBACK_SCENES_PER_BATCH}-scene raw JSON mode..."
+                    "Retrying scenes ${subRange.startSceneId}–${subRange.endSceneId} in compact ${FALLBACK_SCENES_PER_BATCH}-scene json mode..."
                 )
                 val fallbackUser = buildBatchSceneProductionPrompt(
                     topic = topic,
                     durationSeconds = durationSeconds,
                     style = style,
                     budget = budget,
-                    blueprint = blueprint,
                     batchRange = subRange,
-                    previousBatchSummary = subPrevSummary,
-                    forceRawArrayOnly = true
+                    previousBatchSummary = subPrevSummary
                 )
                 val retryRaw = executeOpenAiChatCompletion(
                     url = url,
@@ -364,14 +316,8 @@ class LlmDirectorClient(
                     apiKey = apiKey,
                     systemPrompt = fallbackSystem,
                     userPrompt = fallbackUser,
-                    extraHeaders = extraHeaders,
-                    useJsonObjectMode = false
+                    extraHeaders = extraHeaders
                 )
-                if (!hasJsonArrayBrackets(retryRaw)) {
-                    throw MalformedSceneJsonException(
-                        "No JSON array brackets found after ${FALLBACK_SCENES_PER_BATCH}-scene fallback retry. Raw LLM output: ${retryRaw.trim().take(220)}"
-                    )
-                }
                 val parsedSub = JsonSanitizer.parseAndValidateScenes(retryRaw)
                 val alignedSub = alignBatchSceneIds(parsedSub, subRange)
                 subResults.addAll(alignedSub)
@@ -384,9 +330,8 @@ class LlmDirectorClient(
     private suspend fun validateScenesOrRepair(
         initialScenes: List<SceneScript>,
         budget: DurationBudget,
-        blueprint: String,
         onStatus: (String) -> Unit,
-        requestRepair: suspend (repairUserPrompt: String, forceRawArrayOnly: Boolean) -> String
+        requestRepair: suspend (repairUserPrompt: String) -> String
     ): List<SceneScript> {
         var working = initialScenes
             .sortedBy { it.sceneId }
@@ -417,11 +362,9 @@ class LlmDirectorClient(
                         workingScenes = working,
                         targetSceneIds = batchIds,
                         report = report,
-                        budget = budget,
-                        blueprint = blueprint,
-                        forceRawArrayOnly = false
+                        budget = budget
                     )
-                    val rawRepaired = requestRepair(repairPrompt, false)
+                    val rawRepaired = requestRepair(repairPrompt)
                     JsonSanitizer.parseAndValidateScenes(rawRepaired)
                 } catch (_: MalformedSceneJsonException) {
                     val smallRepairs = mutableListOf<SceneScript>()
@@ -430,11 +373,9 @@ class LlmDirectorClient(
                             workingScenes = working,
                             targetSceneIds = subIds,
                             report = report,
-                            budget = budget,
-                            blueprint = blueprint,
-                            forceRawArrayOnly = true
+                            budget = budget
                         )
-                        val rawSub = requestRepair(subPrompt, true)
+                        val rawSub = requestRepair(subPrompt)
                         smallRepairs.addAll(JsonSanitizer.parseAndValidateScenes(rawSub))
                     }
                     smallRepairs
@@ -468,13 +409,11 @@ class LlmDirectorClient(
         apiKey: String,
         systemPrompt: String,
         userPrompt: String,
-        extraHeaders: Map<String, String>,
-        useJsonObjectMode: Boolean = false
+        extraHeaders: Map<String, String>
     ): String {
-        var includeResponseFormat = useJsonObjectMode
-        var includeReasoningEffort = true
+        var compatFlags = ChatPayloadCompatFlags()
 
-        while (true) {
+        for (compatAttempt in 1..4) {
             try {
                 val (choice, rawBody) = performSingleOpenAiChatCompletion(
                     url = url,
@@ -484,8 +423,7 @@ class LlmDirectorClient(
                     userPrompt = userPrompt,
                     extraHeaders = extraHeaders,
                     temperature = DEFAULT_TEMPERATURE,
-                    includeResponseFormat = includeResponseFormat,
-                    includeReasoningEffort = includeReasoningEffort
+                    compatFlags = compatFlags
                 )
                 if (choice.content.isNotBlank()) {
                     return choice.content
@@ -494,16 +432,15 @@ class LlmDirectorClient(
                     "Empty message.content in LLM response (model may have exhausted tokens thinking) | URL: ${url.trim()} | Model: ${UniversalModelDetector.cleanCredential(model)} | Body: ${rawBody.take(220)}"
                 )
             } catch (e: LlmHttpException) {
-                val badReasoning = includeReasoningEffort && isUnsupportedReasoningEffortError(e.statusCode, e.rawBody)
-                val badFormat = includeResponseFormat && isUnsupportedResponseFormatError(e.statusCode, e.rawBody)
-                if (badReasoning || badFormat) {
-                    if (badReasoning) includeReasoningEffort = false
-                    if (badFormat) includeResponseFormat = false
+                val nextFlags = nextCompatFlagsOnHttpError(compatFlags, e.statusCode, e.rawBody)
+                if (nextFlags != null && compatAttempt < 4) {
+                    compatFlags = nextFlags
                     continue
                 }
                 throw e
             }
         }
+        throw IOException("LLM request exhausted compatibility retries | URL: ${url.trim()} | Model: ${UniversalModelDetector.cleanCredential(model)}")
     }
 
     private fun performSingleOpenAiChatCompletion(
@@ -514,8 +451,7 @@ class LlmDirectorClient(
         userPrompt: String,
         extraHeaders: Map<String, String>,
         temperature: Double,
-        includeResponseFormat: Boolean,
-        includeReasoningEffort: Boolean
+        compatFlags: ChatPayloadCompatFlags
     ): Pair<OpenAiChoiceResult, String> {
         val cleanKey = UniversalModelDetector.cleanCredential(apiKey)
         val cleanModel = UniversalModelDetector.cleanCredential(model)
@@ -525,10 +461,15 @@ class LlmDirectorClient(
             put("model", cleanModel)
             put("temperature", temperature)
             put("max_tokens", MAX_TOKENS)
-            if (includeReasoningEffort) {
-                put("reasoning_effort", DEFAULT_REASONING_EFFORT)
+            if (compatFlags.includeThinking) {
+                put("thinking", JSONObject().apply {
+                    put("type", "disabled")
+                })
             }
-            if (includeResponseFormat) {
+            if (compatFlags.includeEnableThinking) {
+                put("enable_thinking", false)
+            }
+            if (compatFlags.includeResponseFormat) {
                 put("response_format", JSONObject().apply {
                     put("type", "json_object")
                 })
@@ -572,39 +513,71 @@ class LlmDirectorClient(
         const val READ_TIMEOUT_SEC = 90L
         const val WRITE_TIMEOUT_SEC = 30L
         const val MAX_TOKENS = 4096
-        const val MAX_SCENES_PER_BATCH = 5
-        const val FALLBACK_SCENES_PER_BATCH = 3
+        const val MAX_SCENES_PER_BATCH = 4
+        const val FALLBACK_SCENES_PER_BATCH = 2
         const val DEFAULT_TEMPERATURE = 0.6
-        const val DEFAULT_REASONING_EFFORT = "low"
 
         const val STRICT_JSON_OUTPUT_FOOTER =
             "CRITICAL OUTPUT FORMAT: Return ONLY a raw JSON object {\"scenes\": [ ... ]} with zero markdown fences or commentary."
-        const val RAW_ARRAY_RETRY_DIRECTIVE =
-            "Respond ONLY with the raw JSON array starting with [ and ending with ]. Do not output planning notes."
 
         fun isUnsupportedResponseFormatError(statusCode: Int, rawBody: String): Boolean {
-            if (statusCode != 400) return false
+            if (statusCode != 400 && statusCode != 422) return false
             val lower = rawBody.lowercase()
             return lower.contains("response_format") ||
                 lower.contains("json_object") ||
                 lower.contains("structured_outputs")
         }
 
-        fun isUnsupportedReasoningEffortError(statusCode: Int, rawBody: String): Boolean {
-            if (statusCode != 400) return false
+        fun isUnsupportedEnableThinkingError(statusCode: Int, rawBody: String): Boolean {
+            if (statusCode != 400 && statusCode != 422) return false
+            return rawBody.lowercase().contains("enable_thinking")
+        }
+
+        fun isUnsupportedThinkingFieldError(statusCode: Int, rawBody: String): Boolean {
+            if (statusCode != 400 && statusCode != 422) return false
             val lower = rawBody.lowercase()
-            return lower.contains("reasoning_effort") ||
-                (lower.contains("reasoning") && (
-                    lower.contains("unsupported") ||
-                        lower.contains("not supported") ||
-                        lower.contains("does not support") ||
-                        lower.contains("unknown") ||
-                        lower.contains("invalid") ||
-                        lower.contains("not allowed") ||
-                        lower.contains("unrecognized") ||
-                        lower.contains("extra inputs")
-                )) ||
-                (lower.contains("extra inputs are not permitted") && !lower.contains("response_format"))
+            val strippedEnableThinking = lower.replace("enable_thinking", "")
+            return strippedEnableThinking.contains("thinking")
+        }
+
+        fun isGenericUnsupportedFieldError(statusCode: Int, rawBody: String): Boolean {
+            if (statusCode != 400 && statusCode != 422) return false
+            val lower = rawBody.lowercase()
+            return lower.contains("extra inputs are not permitted") ||
+                lower.contains("unknown parameter") ||
+                lower.contains("unrecognized") ||
+                lower.contains("additional properties are not allowed")
+        }
+
+        fun nextCompatFlagsOnHttpError(
+            current: ChatPayloadCompatFlags,
+            statusCode: Int,
+            rawBody: String
+        ): ChatPayloadCompatFlags? {
+            if (statusCode != 400 && statusCode != 422) return null
+            val badEnableThinking = current.includeEnableThinking && isUnsupportedEnableThinkingError(statusCode, rawBody)
+            val badThinking = current.includeThinking && isUnsupportedThinkingFieldError(statusCode, rawBody)
+            val badResponseFormat = current.includeResponseFormat && isUnsupportedResponseFormatError(statusCode, rawBody)
+
+            if (badEnableThinking || badThinking || badResponseFormat) {
+                val next = current.copy(
+                    includeThinking = current.includeThinking && !badThinking,
+                    includeEnableThinking = current.includeEnableThinking && !badEnableThinking,
+                    includeResponseFormat = current.includeResponseFormat && !badResponseFormat
+                )
+                return if (next != current) next else null
+            }
+
+            if (isGenericUnsupportedFieldError(statusCode, rawBody) &&
+                (current.includeThinking || current.includeEnableThinking || current.includeResponseFormat)
+            ) {
+                return ChatPayloadCompatFlags(
+                    includeThinking = false,
+                    includeEnableThinking = false,
+                    includeResponseFormat = false
+                )
+            }
+            return null
         }
 
         fun hasJsonArrayBrackets(rawText: String): Boolean {
@@ -772,76 +745,38 @@ class LlmDirectorClient(
             return """
 MANDATORY DURATION & LENGTH CONTRACT:
 - Target Duration: ${budget.targetDurationSeconds} seconds (calibrated at 15.5 Tagalog chars/sec + 0.45s breathing pause per scene cut).
-- Produce EXACTLY ${budget.targetSceneCount} scenes in the JSON array.
+- Produce EXACTLY ${budget.targetSceneCount} scenes in the json "scenes" array.
 - Combined "tagalog_narration" character count across ALL ${budget.targetSceneCount} scenes MUST be strictly between ${budget.minChars} and ${budget.maxChars} characters (and AT LEAST $strictMin characters — >= 94% of ${budget.targetSpokenChars} target characters).
 - Every single scene's "tagalog_narration" MUST contain at least $MIN_WORDS_PER_NARRATION words and at least $MIN_CHARS_PER_NARRATION characters.
 - Preserve the voice, tone, and style of the master prompt while strictly obeying this scene count and spoken length.
             """.trimIndent()
         }
 
-        fun buildBlueprintSystemPrompt(activeCreativePrompt: String): String {
-            val safeCreative = activeCreativePrompt.trim().ifEmpty { BuiltInPrompts.VIRAL_PINOY_EXPLAINER.content }
-            return """
-$safeCreative
-
-You are in PASS 1 (Beat-by-Beat Narrative Blueprinting). Plan every scene cleanly before JSON production so there is zero laziness or token fatigue in later scenes.
-PASS 1 PLAIN TEXT ONLY: Ignore any JSON output instructions during Pass 1. Output ONLY a numbered plain-text beat-by-beat narrative outline.
-            """.trimIndent()
-        }
-
-        fun buildPass2SystemPrompt(
+        fun buildDirectorSystemPrompt(
             composedSystemPrompt: String,
-            retryHint: String = "",
-            forceRawArrayOnly: Boolean = false
+            retryHint: String = ""
         ): String = buildString {
             append(composedSystemPrompt.trim())
             if (retryHint.isNotBlank()) {
                 append("\n\n")
                 append(retryHint.trim())
             }
-            append("\n\n")
-            append(if (forceRawArrayOnly) RAW_ARRAY_RETRY_DIRECTIVE else STRICT_JSON_OUTPUT_FOOTER)
-        }
-
-        fun buildNarrativeBlueprintPrompt(
-            topic: String,
-            durationSeconds: Int,
-            style: AnimationStyle,
-            budget: DurationBudget
-        ): String {
-            val minCharsPerScene = (budget.targetSpokenChars.toDouble() / budget.targetSceneCount.toDouble())
-                .roundToInt()
-                .coerceAtLeast(MIN_CHARS_PER_NARRATION)
-            return """
-Create a numbered Beat-by-Beat Narrative Blueprint for EXACTLY ${budget.targetSceneCount} scenes (~${durationSeconds}s vertical 9:16 video in "${style.displayName}" style).
-Topic: $topic
-Calibrated Timing: 15.5 Tagalog spoken chars/sec (target ${budget.targetSpokenChars} total chars; ~${minCharsPerScene}+ chars and >= $MIN_WORDS_PER_NARRATION Tagalog words per scene).
-
-Lock all of the following for EACH scene 1..${budget.targetSceneCount}:
-1. Narrative Role (Scene 1 Hook -> Conflict/Explanation beats -> Emotional shifts -> Final Payoff/Lesson).
-2. Key Tagalog talking point & estimated spoken char length (~${minCharsPerScene} chars).
-3. Distinct Visual Plan (main subject & action/pose, facial expression & hand prop, foreground/background environment, lighting/atmosphere).
-4. Planned non-repeating camera_motion, character_pose, and shot_framing so consecutive scenes NEVER repeat the same framing/pose/camera.
-
-Output ONLY the numbered plain-text outline now (do NOT output JSON in Pass 1).
-            """.trimIndent()
+            append("\n\nOutput valid json matching {\"scenes\": [ ... ]}.\n")
+            append(STRICT_JSON_OUTPUT_FOOTER)
         }
 
         fun buildSceneProductionPrompt(
             topic: String,
             durationSeconds: Int,
             style: AnimationStyle,
-            budget: DurationBudget,
-            blueprint: String
+            budget: DurationBudget
         ): String = buildBatchSceneProductionPrompt(
             topic = topic,
             durationSeconds = durationSeconds,
             style = style,
             budget = budget,
-            blueprint = blueprint,
             batchRange = SceneBatchRange(1, budget.targetSceneCount),
-            previousBatchSummary = "",
-            forceRawArrayOnly = false
+            previousBatchSummary = ""
         )
 
         fun buildBatchSceneProductionPrompt(
@@ -849,10 +784,8 @@ Output ONLY the numbered plain-text outline now (do NOT output JSON in Pass 1).
             durationSeconds: Int,
             style: AnimationStyle,
             budget: DurationBudget,
-            blueprint: String,
             batchRange: SceneBatchRange,
-            previousBatchSummary: String = "",
-            forceRawArrayOnly: Boolean = false
+            previousBatchSummary: String = ""
         ): String {
             val isFullScript = batchRange.startSceneId == 1 && batchRange.endSceneId == budget.targetSceneCount
             val batchTargetChars = ((budget.targetSpokenChars.toDouble() * batchRange.count) / budget.targetSceneCount.coerceAtLeast(1))
@@ -860,38 +793,38 @@ Output ONLY the numbered plain-text outline now (do NOT output JSON in Pass 1).
                 .coerceAtLeast(batchRange.count * MIN_CHARS_PER_NARRATION)
             val batchMinChars = (batchTargetChars * 0.90).roundToInt()
             val batchMaxChars = (batchTargetChars * 1.12).roundToInt()
+            val storyPhaseGuidance = when {
+                isFullScript -> "Cover the complete arc from Scene 1 Hook -> Conflict/Explanation -> Final Payoff."
+                batchRange.startSceneId == 1 -> "Opening Beat: Start with an immediate attention-grabbing Tagalog hook and introduce the core problem/topic clearly."
+                batchRange.endSceneId >= budget.targetSceneCount -> "Closing Beat: Resolve the explanation with emotional climax, practical insight, and a memorable final payoff."
+                else -> "Middle Beat: Deepen the explanation/story conflict with vivid relatable Pinoy examples and clear emotional progression."
+            }
 
             return buildString {
                 append("Topic: $topic\n")
                 append("Visual Rendering Style (aesthetic & camera feel ONLY—do NOT override story topic/characters): ${style.displayName}\n")
                 append("Target Full Video Duration: ${durationSeconds} seconds (${budget.targetSceneCount} total scenes)\n")
-                append("CURRENT BATCH SCOPE: Generate ONLY Scenes ${batchRange.startSceneId}..${batchRange.endSceneId} (${batchRange.count} scenes), using scene_id ${batchRange.startSceneId} through ${batchRange.endSceneId}.\n\n")
+                append("CURRENT BATCH SCOPE: Generate ONLY Scenes ${batchRange.startSceneId}..${batchRange.endSceneId} (${batchRange.count} scenes), using scene_id ${batchRange.startSceneId} through ${batchRange.endSceneId}.\n")
+                append("Story Pacing Guidance: $storyPhaseGuidance\n\n")
                 if (previousBatchSummary.isNotBlank()) {
                     append("--- PREVIOUS BATCH CONTINUITY SUMMARY ---\n")
                     append(previousBatchSummary.trim())
                     append("\n\n")
                 }
-                append("--- LOCKED PASS 1 NARRATIVE BLUEPRINT ---\n")
-                append(blueprint.trim())
-                append("\n\n--- PASS 2 GRANULAR SCENE PRODUCTION RULES ---\n")
-                append("Expand beats ${batchRange.startSceneId}..${batchRange.endSceneId} into full JSON scene objects with ZERO shortcuts:\n")
+                append("--- GRANULAR JSON SCENE PRODUCTION RULES ---\n")
+                append("Produce Scenes ${batchRange.startSceneId}..${batchRange.endSceneId} directly as valid json with ZERO shortcuts:\n")
                 append("- Every tagalog_narration MUST be natural conversational Filipino/Tagalog with >= $MIN_WORDS_PER_NARRATION words AND >= $MIN_CHARS_PER_NARRATION chars.\n")
                 append("- Every visual_description MUST have >= $MIN_WORDS_PER_VISUAL_DESCRIPTION vivid English words detailing (1) main subject & exact action/pose, (2) facial expression & hand prop, (3) specific environment/foreground/background elements, and (4) lighting/atmosphere. NEVER write 'generic', 'simple background', or 'etc'.\n")
                 append("- Consecutive scenes MUST NOT repeat the same camera_motion, character_pose, or shot_framing (never use STATIC).\n")
-                append("- TOPIC-FIRST RULE: Derive 100% of characters, wardrobe, environment_theme, props, cutaway_diagram_prompt, and diagrams strictly from the Topic & Blueprint.\n\n")
+                append("- TOPIC-FIRST RULE: Derive 100% of characters, wardrobe, environment_theme, props, cutaway_diagram_prompt, and diagrams strictly from the Topic.\n\n")
                 if (isFullScript) {
                     append(buildDurationContractBlock(budget))
                     append("\n\n")
                 } else {
                     append("BATCH LENGTH BUDGET: Combined tagalog_narration across Scenes ${batchRange.startSceneId}..${batchRange.endSceneId} should be ~$batchTargetChars chars (between $batchMinChars and $batchMaxChars chars).\n\n")
                 }
-                if (forceRawArrayOnly) {
-                    append("Produce ONLY scenes ${batchRange.startSceneId}..${batchRange.endSceneId} (${batchRange.count} scene objects).\n")
-                    append(RAW_ARRAY_RETRY_DIRECTIVE)
-                } else {
-                    append("Produce ONLY scenes ${batchRange.startSceneId}..${batchRange.endSceneId} (${batchRange.count} scene objects) inside {\"scenes\": [...]}.\n")
-                    append(STRICT_JSON_OUTPUT_FOOTER)
-                }
+                append("Return valid json containing ONLY scenes ${batchRange.startSceneId}..${batchRange.endSceneId} (${batchRange.count} scene objects) inside {\"scenes\": [...]}.\n")
+                append(STRICT_JSON_OUTPUT_FOOTER)
             }
         }
 
@@ -899,22 +832,18 @@ Output ONLY the numbered plain-text outline now (do NOT output JSON in Pass 1).
             workingScenes: List<SceneScript>,
             targetSceneIds: List<Int>,
             report: ScriptQualityReport,
-            budget: DurationBudget,
-            blueprint: String,
-            forceRawArrayOnly: Boolean = false
+            budget: DurationBudget
         ): String {
             val issueById = report.sceneIssues.associateBy { it.sceneId }
             val existingById = workingScenes.associateBy { it.sceneId }
             return buildString {
-                append("TARGETED SCENE QUALITY REPAIR PASS:\n")
+                append("TARGETED SCENE QUALITY REPAIR PASS (json output):\n")
                 append("Only rewrite/produce the missing or deficient scenes listed below. Do NOT summarize or omit any detail.\n")
                 if (report.totalSpokenChars < report.requiredMinSpokenChars) {
                     val deficit = report.requiredMinSpokenChars - report.totalSpokenChars
                     append("Global spoken char shortfall: currently ${report.totalSpokenChars}, must reach at least ${report.requiredMinSpokenChars} (+$deficit more Tagalog chars needed across the target scenes).\n")
                 }
-                append("\nBlueprint Reference:\n")
-                append(blueprint.take(1800))
-                append("\n\nScenes requiring repair or completion:\n")
+                append("\nScenes requiring repair or completion:\n")
                 targetSceneIds.forEach { id ->
                     val reasons = when {
                         id in report.missingSceneIds -> listOf("MISSING SCENE (truncated or omitted in prior output)")
@@ -937,13 +866,8 @@ Output ONLY the numbered plain-text outline now (do NOT output JSON in Pass 1).
                 append("- \"tagalog_narration\": >= $MIN_WORDS_PER_NARRATION words and >= $MIN_CHARS_PER_NARRATION chars of natural Tagalog.\n")
                 append("- \"visual_description\": >= $MIN_WORDS_PER_VISUAL_DESCRIPTION words explicitly covering (1) main subject & exact action/pose, (2) facial expression & hand prop, (3) specific environment/foreground/background elements, (4) lighting/atmosphere; zero 'generic', 'simple background', or 'etc'.\n")
                 append("- Valid non-STATIC \"camera_motion\", explicit \"character_pose\", and explicit \"shot_framing\" distinct from adjacent scenes.\n")
-                if (forceRawArrayOnly) {
-                    append("\nInclude ONLY scene_id(s): ${targetSceneIds.joinToString(", ")}.\n")
-                    append(RAW_ARRAY_RETRY_DIRECTIVE)
-                } else {
-                    append("\nInclude ONLY scene_id(s): ${targetSceneIds.joinToString(", ")} inside {\"scenes\": [...]}.\n")
-                    append(STRICT_JSON_OUTPUT_FOOTER)
-                }
+                append("\nReturn valid json with ONLY scene_id(s): ${targetSceneIds.joinToString(", ")} inside {\"scenes\": [...]}.\n")
+                append(STRICT_JSON_OUTPUT_FOOTER)
             }
         }
 

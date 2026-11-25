@@ -5,6 +5,7 @@ import com.example.art.EnvironmentRenderer
 import com.example.art.MagicByteValidator
 import com.example.art.SceneArtGenerator
 import com.example.data.BuiltInPrompts
+import com.example.llm.ChatPayloadCompatFlags
 import com.example.llm.JsonSanitizer
 import com.example.llm.LlmDirectorClient
 import com.example.llm.LlmHttpException
@@ -1171,31 +1172,21 @@ class ToonForgeCoreTest {
 
     @Test
     fun `zeroShortcutAntiLazinessQualityGateWorksAcrossScriptArtPuppetCameraAndTts`() {
-        // 1. Two-Stage Director Prompts & Spoken-Char 94% Gate
+        // 1. Direct JSON Batch Director Prompts & Spoken-Char 94% Gate
         val budget30 = LlmDirectorClient.calculateDurationBudget(30)
         assertEquals(6, budget30.targetSceneCount)
         assertEquals(398, LlmDirectorClient.requiredMinSpokenChars(budget30)) // (423 * 0.94).roundToInt() = 398
         assertEquals(2, LlmDirectorClient.MAX_REPAIR_PASSES)
 
-        val blueprintPrompt = LlmDirectorClient.buildNarrativeBlueprintPrompt(
+        val prodPrompt = LlmDirectorClient.buildSceneProductionPrompt(
             topic = "Paano mag-ipon ng ₱1,000 gamit ang 50-30-20 rule",
             durationSeconds = 30,
             style = AnimationStyle.PAPER_DIORAMA,
             budget = budget30
         )
-        assertTrue(blueprintPrompt.contains("EXACTLY 6 scenes"))
-        assertTrue(blueprintPrompt.contains("15.5 Tagalog spoken chars/sec"))
-        assertTrue(blueprintPrompt.contains(">= 11 Tagalog words"))
-
-        val prodPrompt = LlmDirectorClient.buildSceneProductionPrompt(
-            topic = "Paano mag-ipon ng ₱1,000 gamit ang 50-30-20 rule",
-            durationSeconds = 30,
-            style = AnimationStyle.PAPER_DIORAMA,
-            budget = budget30,
-            blueprint = "1. Hook\n2. Explain"
-        )
-        assertTrue(prodPrompt.contains("LOCKED PASS 1 NARRATIVE BLUEPRINT"))
+        assertTrue(prodPrompt.contains("GRANULAR JSON SCENE PRODUCTION RULES"))
         assertTrue(prodPrompt.contains("ZERO shortcuts"))
+        assertTrue(prodPrompt.contains("json"))
 
         // 2. Kotlin Anti-Laziness Validator rejects short narration, vague visual fillers, missing dimensions & consecutive repeats
         val goodVisual = "Young Filipino worker leaning forward at wooden market counter while smiling with bright eyes, holding a steaming coffee cup in warm golden morning sunlight."
@@ -1242,8 +1233,7 @@ class ToonForgeCoreTest {
             workingScenes = lazyScenes,
             targetSceneIds = listOf(1, 2, 3, 4, 5, 6),
             report = badReport,
-            budget = budget30,
-            blueprint = "1-6"
+            budget = budget30
         )
         assertTrue(repairPrompt.contains("TARGETED SCENE QUALITY REPAIR PASS"))
         assertTrue(repairPrompt.contains("Scene 1 failure reason(s)"))
@@ -1429,16 +1419,9 @@ class ToonForgeCoreTest {
         assertTrue(capturedMsg.contains("Pasensya na, ito ay isang kuwentong walang brackets!"))
         assertTrue(capturedMsg.length <= "No JSON array brackets found. Raw LLM output: ".length + 220)
 
-        // 4. Pass 1 stays strictly plain-text outline; Pass 2 places structured {"scenes": [...]} footer at VERY END
+        // 4. Direct JSON mode ("json" in prompt, {"scenes": [...]} footer at VERY END, zero Pass 1 plain-text outline)
         val customMasterPrompt = "Custom Master Prompt with creative instructions."
-        val pass1Sys = LlmDirectorClient.buildBlueprintSystemPrompt(customMasterPrompt)
-        assertTrue(pass1Sys.contains("PASS 1 PLAIN TEXT ONLY"))
-        assertTrue(pass1Sys.contains("Ignore any JSON output instructions during Pass 1"))
-
         val budget30 = LlmDirectorClient.calculateDurationBudget(30)
-        val pass1User = LlmDirectorClient.buildNarrativeBlueprintPrompt("Ipon", 30, AnimationStyle.PAPER_DIORAMA, budget30)
-        assertTrue(pass1User.contains("do NOT output JSON in Pass 1"))
-
         val expectedFooter = "CRITICAL OUTPUT FORMAT: Return ONLY a raw JSON object {\"scenes\": [ ... ]} with zero markdown fences or commentary."
         assertEquals(expectedFooter, LlmDirectorClient.STRICT_JSON_OUTPUT_FOOTER)
 
@@ -1448,59 +1431,88 @@ class ToonForgeCoreTest {
         assertFalse(composedSys.contains("[A]"))
         assertFalse(composedSys.contains("[B]"))
 
-        val pass2Sys = LlmDirectorClient.buildPass2SystemPrompt(composedSys, retryHint = "Retry now.")
-        assertTrue(pass2Sys.endsWith(expectedFooter))
+        val directorSys = LlmDirectorClient.buildDirectorSystemPrompt(composedSys, retryHint = "Retry now.")
+        assertTrue(directorSys.contains("json"))
+        assertTrue(directorSys.endsWith(expectedFooter))
 
-        val pass2User = LlmDirectorClient.buildSceneProductionPrompt("Ipon", 30, AnimationStyle.PAPER_DIORAMA, budget30, "1. Beat one")
-        assertTrue(pass2User.endsWith(expectedFooter))
+        val directUser = LlmDirectorClient.buildSceneProductionPrompt("Ipon", 30, AnimationStyle.PAPER_DIORAMA, budget30)
+        assertTrue(directUser.contains("json"))
+        assertTrue(directUser.endsWith(expectedFooter))
 
         val repairUser = LlmDirectorClient.buildTargetedRepairPrompt(
             workingScenes = emptyList(),
             targetSceneIds = listOf(1),
             report = LlmDirectorClient.validateSceneQuality(emptyList(), budget30),
-            budget = budget30,
-            blueprint = "1. Beat one"
+            budget = budget30
         )
+        assertTrue(repairUser.contains("json"))
         assertTrue(repairUser.endsWith(expectedFooter))
 
-        // 5. HTTP 400 response_format & reasoning_effort fallback detection, temp 0.6, and batching
+        // 5. Thinking-disabled HTTP 400/422 compatibility stripping, temp 0.6, and 4-scene sequential batching
         assertTrue(LlmDirectorClient.isUnsupportedResponseFormatError(400, "{\"error\":\"Unsupported parameter: response_format\"}"))
-        assertTrue(LlmDirectorClient.isUnsupportedResponseFormatError(400, "json_object mode not supported by this model"))
+        assertTrue(LlmDirectorClient.isUnsupportedResponseFormatError(422, "json_object mode not supported by this model"))
         assertFalse(LlmDirectorClient.isUnsupportedResponseFormatError(401, "Invalid response_format"))
-        assertFalse(LlmDirectorClient.isUnsupportedResponseFormatError(400, "{\"error\":\"Invalid API key\"}"))
 
-        assertTrue(LlmDirectorClient.isUnsupportedReasoningEffortError(400, "{\"error\":\"Unknown parameter: 'reasoning_effort'\"}"))
-        assertTrue(LlmDirectorClient.isUnsupportedReasoningEffortError(400, "reasoning effort is not supported for this model"))
-        assertFalse(LlmDirectorClient.isUnsupportedReasoningEffortError(401, "reasoning_effort unsupported"))
-        assertFalse(LlmDirectorClient.isUnsupportedReasoningEffortError(400, "{\"error\":\"Invalid API key\"}"))
+        assertTrue(LlmDirectorClient.isUnsupportedThinkingFieldError(400, "{\"error\":\"Unknown parameter: 'thinking'\"}"))
+        assertTrue(LlmDirectorClient.isUnsupportedThinkingFieldError(422, "Extra inputs: thinking"))
+        assertFalse(LlmDirectorClient.isUnsupportedThinkingFieldError(400, "{\"error\":\"Unknown parameter: 'enable_thinking'\"}"))
+
+        assertTrue(LlmDirectorClient.isUnsupportedEnableThinkingError(400, "{\"error\":\"Unknown parameter: 'enable_thinking'\"}"))
+        assertTrue(LlmDirectorClient.isUnsupportedEnableThinkingError(422, "enable_thinking is not allowed"))
+
+        val startFlags = ChatPayloadCompatFlags()
+        val afterThinking400 = LlmDirectorClient.nextCompatFlagsOnHttpError(
+            startFlags,
+            400,
+            "{\"error\":\"Unknown parameter: 'thinking'\"}"
+        )!!
+        assertFalse(afterThinking400.includeThinking)
+        assertTrue(afterThinking400.includeEnableThinking)
+        assertTrue(afterThinking400.includeResponseFormat)
+
+        val afterEnableThinking422 = LlmDirectorClient.nextCompatFlagsOnHttpError(
+            afterThinking400,
+            422,
+            "{\"detail\":\"Extra inputs are not permitted: enable_thinking\"}"
+        )!!
+        assertFalse(afterEnableThinking422.includeThinking)
+        assertFalse(afterEnableThinking422.includeEnableThinking)
+        assertTrue(afterEnableThinking422.includeResponseFormat)
+
+        val afterFormat400 = LlmDirectorClient.nextCompatFlagsOnHttpError(
+            afterEnableThinking422,
+            400,
+            "response_format json_object not supported"
+        )!!
+        assertFalse(afterFormat400.includeThinking)
+        assertFalse(afterFormat400.includeEnableThinking)
+        assertFalse(afterFormat400.includeResponseFormat)
+        assertEquals(null, LlmDirectorClient.nextCompatFlagsOnHttpError(startFlags, 401, "Unauthorized"))
 
         assertEquals(0.6, LlmDirectorClient.DEFAULT_TEMPERATURE, 0.001)
-        assertEquals("low", LlmDirectorClient.DEFAULT_REASONING_EFFORT)
-        assertEquals(5, LlmDirectorClient.MAX_SCENES_PER_BATCH)
-        assertEquals(3, LlmDirectorClient.FALLBACK_SCENES_PER_BATCH)
+        assertEquals(4, LlmDirectorClient.MAX_SCENES_PER_BATCH)
+        assertEquals(2, LlmDirectorClient.FALLBACK_SCENES_PER_BATCH)
         assertEquals("[{\"scene_id\":1}]", LlmDirectorClient.stripThinkingBlocks("<think>internal</think>\n[{\"scene_id\":1}]"))
         assertTrue(LlmDirectorClient.hasJsonArrayBrackets("{\"scenes\": [{\"scene_id\": 1}]}"))
         assertFalse(LlmDirectorClient.hasJsonArrayBrackets("Plain planning notes without array brackets"))
 
-        // Batching for 60s-90s videos (12-20 scenes): max 5 scenes per request
-        val batches13 = LlmDirectorClient.computeSceneBatches(13)
-        assertEquals(
-            listOf(SceneBatchRange(1, 5), SceneBatchRange(6, 10), SceneBatchRange(11, 13)),
-            batches13
-        )
+        // Batching for 30s-120s videos: max 4 scenes per request
+        val batches6 = LlmDirectorClient.computeSceneBatches(6)
+        assertEquals(listOf(SceneBatchRange(1, 4), SceneBatchRange(5, 6)), batches6)
+        val batches12 = LlmDirectorClient.computeSceneBatches(12)
+        assertEquals(listOf(SceneBatchRange(1, 4), SceneBatchRange(5, 8), SceneBatchRange(9, 12)), batches12)
         val batches20 = LlmDirectorClient.computeSceneBatches(20)
-        assertEquals(4, batches20.size)
-        assertTrue(batches20.all { it.count in 1..5 })
-        assertEquals(listOf(SceneBatchRange(1, 5)), LlmDirectorClient.computeSceneBatches(5))
+        assertEquals(5, batches20.size)
+        assertTrue(batches20.all { it.count == 4 })
 
-        // Smaller sub-batch splitting (max 3 scenes) on empty/non-JSON fallback retry
+        // Smaller sub-batch splitting (max 2 scenes) on fallback retry
         assertEquals(
-            listOf(SceneBatchRange(6, 8), SceneBatchRange(9, 10)),
-            LlmDirectorClient.splitBatchRange(SceneBatchRange(6, 10))
+            listOf(SceneBatchRange(5, 6), SceneBatchRange(7, 8)),
+            LlmDirectorClient.splitBatchRange(SceneBatchRange(5, 8))
         )
 
-        // Batch scene ID alignment when LLM re-numbers batch 6..10 starting from 1
-        val renumberedBatch = (1..5).map { idx ->
+        // Batch scene ID alignment when LLM re-numbers batch 5..8 starting from 1
+        val renumberedBatch = (1..4).map { idx ->
             SceneScript(
                 sceneId = idx,
                 tagalogNarration = "Bahagi $idx ng kuwento tungkol sa tamang pag-iipon ng pera sa araw-araw.",
@@ -1512,45 +1524,41 @@ class ToonForgeCoreTest {
                 worldFx = WorldFx.NONE
             )
         }
-        val aligned = LlmDirectorClient.alignBatchSceneIds(renumberedBatch, SceneBatchRange(6, 10))
-        assertEquals(listOf(6, 7, 8, 9, 10), aligned.map { it.sceneId })
+        val aligned = LlmDirectorClient.alignBatchSceneIds(renumberedBatch, SceneBatchRange(5, 8))
+        assertEquals(listOf(5, 6, 7, 8), aligned.map { it.sceneId })
 
         // 2-sentence continuity summary for subsequent batch
         val continuity = LlmDirectorClient.summarizeBatchContinuity(aligned)
-        assertTrue(continuity.contains("Scenes 6-10"))
+        assertTrue(continuity.contains("Scenes 5-8"))
         assertTrue(continuity.contains("PAN_RIGHT"))
         assertEquals(2, continuity.count { it == '.' })
 
-        // Raw array retry prompt places exact directive at very end
+        // Batch prompt includes continuity summary, "json", and ends with STRICT_JSON_OUTPUT_FOOTER
         val budget90 = LlmDirectorClient.calculateDurationBudget(90)
         val batchPromptJson = LlmDirectorClient.buildBatchSceneProductionPrompt(
             topic = "Emergency Fund",
             durationSeconds = 90,
             style = AnimationStyle.FLAT_VECTOR,
             budget = budget90,
-            blueprint = "1. Hook\n6. Middle",
-            batchRange = SceneBatchRange(6, 10),
-            previousBatchSummary = continuity,
-            forceRawArrayOnly = false
+            batchRange = SceneBatchRange(5, 8),
+            previousBatchSummary = continuity
         )
-        assertTrue(batchPromptJson.contains("Scenes 6..10"))
+        assertTrue(batchPromptJson.contains("Scenes 5..8"))
         assertTrue(batchPromptJson.contains(continuity))
+        assertTrue(batchPromptJson.contains("json"))
         assertTrue(batchPromptJson.endsWith(LlmDirectorClient.STRICT_JSON_OUTPUT_FOOTER))
 
-        val batchPromptRawRetry = LlmDirectorClient.buildBatchSceneProductionPrompt(
-            topic = "Emergency Fund",
-            durationSeconds = 90,
-            style = AnimationStyle.FLAT_VECTOR,
-            budget = budget90,
-            blueprint = "1. Hook\n6. Middle",
-            batchRange = SceneBatchRange(6, 8),
-            previousBatchSummary = continuity,
-            forceRawArrayOnly = true
-        )
-        assertTrue(
-            batchPromptRawRetry.endsWith(
-                "Respond ONLY with the raw JSON array starting with [ and ending with ]. Do not output planning notes."
-            )
-        )
+        // JsonSanitizer strips <think>...</think> + markdown fences and parses bare top-level array containing tagalog_narration
+        val thinkAndBareArray = """
+            <think>
+            Let me outline scenes [1] and [2] carefully first.
+            </think>
+            ```json
+            [{"scene_id": 5, "tagalog_narration": "Una sa lahat ay magtabi ng sampung porsyento bago gumastos."}]
+            ```
+        """.trimIndent()
+        val bareExtracted = JsonSanitizer.extractJsonArrayText(thinkAndBareArray)
+        assertTrue(bareExtracted.startsWith("["))
+        assertTrue(bareExtracted.contains("\"scene_id\": 5"))
     }
 }

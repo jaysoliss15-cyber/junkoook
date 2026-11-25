@@ -68,26 +68,7 @@ object JsonSanitizer {
         val slice: String
     )
 
-    fun extractJsonArrayText(rawOutput: String): String {
-        val candidates = collectAllArrayCandidates(rawOutput)
-        if (candidates.isEmpty()) {
-            throw MalformedSceneJsonException(
-                "No JSON array brackets found. Raw LLM output: ${rawOutput.take(220)}"
-            )
-        }
-
-        val best = candidates.firstOrNull { it.isPreferredWrapper && isSceneObjectArrayText(it.slice) }
-            ?: candidates.firstOrNull { isSceneObjectArrayText(it.slice) }
-            ?: candidates.firstOrNull { it.isPreferredWrapper && isObjectArrayText(it.slice) }
-            ?: candidates.firstOrNull { isObjectArrayText(it.slice) }
-            ?: throw MalformedSceneJsonException(
-                "No JSON array of scene objects found. Raw LLM output: ${rawOutput.take(220)}"
-            )
-
-        return best.slice
-    }
-
-    private fun collectAllArrayCandidates(rawOutput: String): List<ArrayCandidate> {
+    fun stripThinkAndMarkdownFences(rawOutput: String): List<String> {
         val withoutThink = rawOutput
             .replace(THINK_BLOCK_REGEX, "")
             .replace(UNCLOSED_THINK_REGEX, "")
@@ -103,13 +84,72 @@ object JsonSanitizer {
             .replace(CODE_FENCE_END, "")
             .trim()
 
-        val searchSpaces = buildList {
+        return buildList {
             addAll(fencedBlocks)
             if (strippedFull.isNotEmpty() && strippedFull !in fencedBlocks) {
                 add(strippedFull)
             }
         }
+    }
 
+    private fun tryUnwrapRootObjectArray(space: String): JSONArray? {
+        val trimmed = space.trim()
+        val objectCandidates = buildList {
+            if (trimmed.startsWith("{")) add(trimmed)
+            val firstBrace = trimmed.indexOf('{')
+            val lastBrace = trimmed.lastIndexOf('}')
+            if (firstBrace >= 0 && lastBrace > firstBrace) {
+                val sliced = trimmed.substring(firstBrace, lastBrace + 1)
+                if (sliced != trimmed) add(sliced)
+            }
+        }
+
+        val orderedKeys = listOf("scenes", "storyboard") + WRAPPER_ARRAY_KEYS.filter { it != "scenes" && it != "storyboard" }
+        for (objText in objectCandidates) {
+            val root = try {
+                JSONObject(objText)
+            } catch (_: Exception) {
+                continue
+            }
+            for (key in orderedKeys) {
+                val arr = root.optJSONArray(key) ?: continue
+                if (isValidSceneJsonArray(arr, requireTagalogNarration = true)) {
+                    return arr
+                }
+            }
+            for (key in orderedKeys) {
+                val arr = root.optJSONArray(key) ?: continue
+                if (isValidSceneJsonArray(arr, requireTagalogNarration = false)) {
+                    return arr
+                }
+            }
+        }
+        return null
+    }
+
+    fun extractJsonArrayText(rawOutput: String): String {
+        val spaces = stripThinkAndMarkdownFences(rawOutput)
+        val candidates = collectAllArrayCandidates(spaces)
+        if (candidates.isEmpty()) {
+            throw MalformedSceneJsonException(
+                "No JSON array brackets found. Raw LLM output: ${rawOutput.take(220)}"
+            )
+        }
+
+        val best = candidates.firstOrNull { it.isPreferredWrapper && isNarrationObjectArrayText(it.slice) }
+            ?: candidates.firstOrNull { isNarrationObjectArrayText(it.slice) }
+            ?: candidates.firstOrNull { it.isPreferredWrapper && isSceneObjectArrayText(it.slice) }
+            ?: candidates.firstOrNull { isSceneObjectArrayText(it.slice) }
+            ?: candidates.firstOrNull { it.isPreferredWrapper && isObjectArrayText(it.slice) }
+            ?: candidates.firstOrNull { isObjectArrayText(it.slice) }
+            ?: throw MalformedSceneJsonException(
+                "No JSON array of scene objects found. Raw LLM output: ${rawOutput.take(220)}"
+            )
+
+        return best.slice
+    }
+
+    private fun collectAllArrayCandidates(searchSpaces: List<String>): List<ArrayCandidate> {
         val seenSlices = LinkedHashSet<String>()
         val results = mutableListOf<ArrayCandidate>()
         for (space in searchSpaces) {
@@ -188,6 +228,11 @@ object JsonSanitizer {
             i++
         }
         return candidates
+    }
+
+    private fun isNarrationObjectArrayText(slice: String): Boolean {
+        if (!isObjectArrayText(slice)) return false
+        return slice.contains("\"tagalog_narration\"")
     }
 
     /**
@@ -281,35 +326,67 @@ object JsonSanitizer {
     }
 
     fun parseAndValidateScenes(rawOutput: String): List<SceneScript> {
-        val candidates = collectAllArrayCandidates(rawOutput)
-        val orderedSlices = buildList {
-            // 1. Inspect wrapper object arrays ({"scenes": [...]} / {"storyboard": [...]}) and direct candidates
-            candidates.filter { it.isPreferredWrapper && isSceneObjectArrayText(it.slice) }
-                .forEach { add(it.slice) }
-            candidates.filter { isSceneObjectArrayText(it.slice) }
-                .forEach { if (it.slice !in this) add(it.slice) }
-            candidates.filter { isObjectArrayText(it.slice) }
-                .forEach { if (it.slice !in this) add(it.slice) }
-        }
+        val spaces = stripThinkAndMarkdownFences(rawOutput)
 
-        if (orderedSlices.isEmpty()) {
-            throw MalformedSceneJsonException(
-                "No JSON array brackets found. Raw LLM output: ${rawOutput.take(220)}"
-            )
-        }
-
+        // 1. Prefer direct root JSONObject parsing (`{"scenes": [...]}` / `{"storyboard": [...]}`)
         var selectedArray: JSONArray? = null
-        var lastSyntaxError: Exception? = null
-        for (slice in orderedSlices) {
-            val arr = try {
-                JSONArray(slice)
-            } catch (e: Exception) {
-                lastSyntaxError = e
-                continue
-            }
-            if (isValidSceneJsonArray(arr)) {
-                selectedArray = arr
+        for (space in spaces) {
+            val unwrapped = tryUnwrapRootObjectArray(space)
+            if (unwrapped != null) {
+                selectedArray = unwrapped
                 break
+            }
+        }
+
+        // 2. Fallback: scan `[...]` blocks in text whose elements are JSONObjects containing `"tagalog_narration"`
+        var lastSyntaxError: Exception? = null
+        if (selectedArray == null) {
+            val candidates = collectAllArrayCandidates(spaces)
+            val orderedSlices = buildList {
+                candidates.filter { it.isPreferredWrapper && isNarrationObjectArrayText(it.slice) }
+                    .forEach { add(it.slice) }
+                candidates.filter { isNarrationObjectArrayText(it.slice) }
+                    .forEach { if (it.slice !in this) add(it.slice) }
+                candidates.filter { it.isPreferredWrapper && isSceneObjectArrayText(it.slice) }
+                    .forEach { if (it.slice !in this) add(it.slice) }
+                candidates.filter { isSceneObjectArrayText(it.slice) }
+                    .forEach { if (it.slice !in this) add(it.slice) }
+                candidates.filter { isObjectArrayText(it.slice) }
+                    .forEach { if (it.slice !in this) add(it.slice) }
+            }
+
+            if (orderedSlices.isEmpty()) {
+                throw MalformedSceneJsonException(
+                    "No JSON array brackets found. Raw LLM output: ${rawOutput.take(220)}"
+                )
+            }
+
+            for (slice in orderedSlices) {
+                val arr = try {
+                    JSONArray(slice)
+                } catch (e: Exception) {
+                    lastSyntaxError = e
+                    continue
+                }
+                if (isValidSceneJsonArray(arr, requireTagalogNarration = true)) {
+                    selectedArray = arr
+                    break
+                }
+            }
+
+            if (selectedArray == null) {
+                for (slice in orderedSlices) {
+                    val arr = try {
+                        JSONArray(slice)
+                    } catch (e: Exception) {
+                        lastSyntaxError = e
+                        continue
+                    }
+                    if (isValidSceneJsonArray(arr, requireTagalogNarration = false)) {
+                        selectedArray = arr
+                        break
+                    }
+                }
             }
         }
 
@@ -327,15 +404,21 @@ object JsonSanitizer {
         return scenes
     }
 
-    private fun isValidSceneJsonArray(array: JSONArray): Boolean {
+    private fun isValidSceneJsonArray(
+        array: JSONArray,
+        requireTagalogNarration: Boolean = true
+    ): Boolean {
         if (array.length() == 0) return false
+        var hasMatchingKey = false
         for (i in 0 until array.length()) {
             val obj = array.optJSONObject(i) ?: return false
-            if (obj.has("tagalog_narration") || obj.has("scene_id")) {
-                return true
+            if (obj.has("tagalog_narration")) {
+                hasMatchingKey = true
+            } else if (!requireTagalogNarration && obj.has("scene_id")) {
+                hasMatchingKey = true
             }
         }
-        return false
+        return hasMatchingKey
     }
 
     private fun parseSceneObject(obj: JSONObject, index: Int): SceneScript {
