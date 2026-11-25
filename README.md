@@ -1,11 +1,23 @@
-<div align="center">
+# ToonForge Tagalog
 
-<img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
+On-device 1080x1920 30fps Tagalog animated storytelling studio built with Kotlin, Jetpack Compose, OkHttp, Jetpack DataStore, Media3 ExoPlayer, and EGL14 + MediaCodec + MediaMuxer hardware MP4 export.
 
-  <h1>Built with AI Studio</h2>
+## Building Locally (Android Studio / CLI)
 
-  <p>The fastest path from prompt to production with Gemini.</p>
+1. Restore the debug signing keystore once after cloning:
+   ```bash
+   base64 -d debug.keystore.base64 > debug.keystore
+   chmod +x ./gradlew
+   ```
+2. Run unit tests and build the debug APK:
+   ```bash
+   ./gradlew :app:testDebugUnitTest
+   ./gradlew :app:assembleDebug
+   ```
+   Output APK: `app/build/outputs/apk/debug/app-debug.apk`
 
-  <a href="https://aistudio.google.com/apps">Start building</a>
+## GitHub Actions CI
 
-</div>
+Pushing to `main` or `master` automatically runs `.github/workflows/android-build.yml`, executes `:app:testDebugUnitTest`, builds `app-debug.apk`, and attaches it as a downloadable workflow artifact (`toonforge-tagalog-debug-apk`).
+
+Optional repository secrets (`KEYSTORE_BASE64`, `STORE_PASSWORD`, `KEY_PASSWORD`) enable automatic signed `assembleRelease` builds as well.
