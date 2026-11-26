@@ -152,9 +152,9 @@ fun SettingsScreen(
         mutableStateOf(UniversalModelDetector.matchPresetForUrl(settings.effectiveLlmBaseUrl))
     }
 
-    var aiHordeKey by remember { mutableStateOf(settings.aiHordeKey) }
+    var useAiHorde by remember { mutableStateOf(settings.useAiHorde) }
+    var aiHordeKey by remember { mutableStateOf(if (settings.aiHordeKey == "0000000000") "" else settings.aiHordeKey) }
     var narrationSpeed by remember { mutableFloatStateOf(settings.narrationSpeed) }
-    var showAdvancedArtKey by remember { mutableStateOf(false) }
 
     LaunchedEffect(settings) {
         ttsBaseUrl = settings.effectiveTtsBaseUrl
@@ -164,7 +164,8 @@ fun SettingsScreen(
         llmApiKey = settings.effectiveLlmApiKey
         selectedModelId = settings.effectiveSelectedModelId
         selectedPreset = UniversalModelDetector.matchPresetForUrl(settings.effectiveLlmBaseUrl)
-        aiHordeKey = settings.aiHordeKey
+        useAiHorde = settings.useAiHorde
+        aiHordeKey = if (settings.aiHordeKey == "0000000000") "" else settings.aiHordeKey
         narrationSpeed = settings.narrationSpeed
     }
 
@@ -212,6 +213,109 @@ fun SettingsScreen(
                 )
             }
 
+            // 0. EXPLICIT SCRIPT & ART ENGINE SWITCH (Custom LLM API vs AI Horde Async Engine)
+            Card(
+                colors = CardDefaults.cardColors(containerColor = StudioSurfaceElevated),
+                border = BorderStroke(
+                    width = 1.dp,
+                    color = if (useAiHorde) ForgeAmber.copy(alpha = 0.65f) else ForgeCyan.copy(alpha = 0.45f)
+                ),
+                shape = MaterialTheme.shapes.large,
+                modifier = Modifier.testTag("engine_switch_card")
+            ) {
+                Column(
+                    modifier = Modifier.padding(14.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                imageVector = Icons.Rounded.AutoAwesome,
+                                contentDescription = null,
+                                tint = if (useAiHorde) ForgeAmber else ForgeCyan,
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Spacer(Modifier.width(6.dp))
+                            Text(
+                                text = "Script & Art Engine Switch",
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                        Surface(
+                            color = (if (useAiHorde) ForgeAmber else ForgeCyan).copy(alpha = 0.16f),
+                            shape = RoundedCornerShape(8.dp)
+                        ) {
+                            Text(
+                                text = if (useAiHorde) "AI Horde Async" else "Custom LLM API",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (useAiHorde) ForgeAmber else ForgeCyan,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                            )
+                        }
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .weight(1f)
+                                .padding(end = 12.dp)
+                        ) {
+                            Text(
+                                text = "Use AI Horde Mode",
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                            Text(
+                                text = if (useAiHorde) {
+                                    "Script & scene art route directly to AI Horde async queue (free community workers, 3s poll up to 180s). No silent LLM fallback."
+                                } else {
+                                    "Uses ONLY your configured OpenAI-compatible LLM API below. No silent AI Horde fallback."
+                                },
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Switch(
+                            checked = useAiHorde,
+                            onCheckedChange = { checked ->
+                                useAiHorde = checked
+                                viewModel.setUseAiHorde(checked)
+                            },
+                            modifier = Modifier.testTag("use_ai_horde_switch")
+                        )
+                    }
+
+                    OutlinedTextField(
+                        value = aiHordeKey,
+                        onValueChange = { raw ->
+                            val clean = cleanInput(raw)
+                            aiHordeKey = clean
+                            viewModel.setAiHordeKey(clean)
+                        },
+                        label = { Text("AI Horde API Key (Optional • Default: 0000000000)") },
+                        placeholder = { Text("0000000000") },
+                        supportingText = {
+                            Text("Blank automatically uses anonymous key 0000000000 • ElevenLabs TTS remains active in both modes")
+                        },
+                        singleLine = true,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("aihorde_api_key_input"),
+                        colors = studioTextFieldColors()
+                    )
+                }
+            }
+
             // 1. UNIVERSAL LLM STORY DIRECTOR & AUTO-DETECTOR
             Card(
                 colors = CardDefaults.cardColors(containerColor = StudioSurface),
@@ -236,21 +340,37 @@ fun SettingsScreen(
                             )
                             Spacer(Modifier.width(6.dp))
                             Text(
-                                text = "Universal LLM Story Director",
+                                text = "Custom LLM Story Director",
                                 style = MaterialTheme.typography.titleSmall,
                                 fontWeight = FontWeight.Bold
                             )
                         }
                         Surface(
-                            color = ForgeCyan.copy(alpha = 0.14f),
+                            color = (if (useAiHorde) ForgeAmber else ForgeCyan).copy(alpha = 0.14f),
                             shape = RoundedCornerShape(8.dp)
                         ) {
                             Text(
-                                text = selectedPreset.label,
+                                text = if (useAiHorde) "Paused (AI Horde On)" else selectedPreset.label,
                                 style = MaterialTheme.typography.labelSmall,
-                                color = ForgeCyan,
+                                color = if (useAiHorde) ForgeAmber else ForgeCyan,
                                 fontWeight = FontWeight.Bold,
                                 modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                            )
+                        }
+                    }
+
+                    if (useAiHorde) {
+                        Surface(
+                            color = ForgeAmber.copy(alpha = 0.10f),
+                            shape = RoundedCornerShape(10.dp),
+                            border = BorderStroke(1.dp, ForgeAmber.copy(alpha = 0.35f)),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(
+                                text = "AI Horde Mode is active above. Custom LLM settings below are saved for when you switch back to Custom LLM API.",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = ForgeAmber,
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp)
                             )
                         }
                     }
@@ -559,42 +679,6 @@ fun SettingsScreen(
                         )
                     }
 
-                    // Collapsible Optional AI Horde Backdrop Art Key
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clickable { showAdvancedArtKey = !showAdvancedArtKey }
-                            .padding(vertical = 4.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Text(
-                            text = "Optional Backdrop Art Key (AI Horde)",
-                            style = MaterialTheme.typography.labelMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            fontWeight = FontWeight.SemiBold
-                        )
-                        Icon(
-                            imageVector = if (showAdvancedArtKey) Icons.Rounded.ExpandLess else Icons.Rounded.ExpandMore,
-                            contentDescription = "Toggle backdrop art key",
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-
-                    AnimatedVisibility(visible = showAdvancedArtKey) {
-                        OutlinedTextField(
-                            value = aiHordeKey,
-                            onValueChange = { aiHordeKey = cleanInput(it) },
-                            label = { Text("AI Horde Art Key (Optional • Default: 0000000000)") },
-                            supportingText = { Text("Used only as image art backup after Pollinations Flux") },
-                            singleLine = true,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .testTag("aihorde_key_input"),
-                            colors = studioTextFieldColors()
-                        )
-                    }
-
                     Button(
                         onClick = {
                             viewModel.saveLlmSettings(
@@ -604,8 +688,9 @@ fun SettingsScreen(
                                 ttsBaseUrl = ttsBaseUrl,
                                 ttsModelId = ttsModelId,
                                 selectedVoiceId = voiceIdInput,
-                                aiHordeKey = aiHordeKey,
-                                narrationSpeed = narrationSpeed
+                                aiHordeKey = aiHordeKey.ifBlank { "0000000000" },
+                                narrationSpeed = narrationSpeed,
+                                useAiHorde = useAiHorde
                             )
                         },
                         modifier = Modifier

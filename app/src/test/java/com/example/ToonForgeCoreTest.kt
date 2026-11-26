@@ -5,6 +5,7 @@ import com.example.art.EnvironmentRenderer
 import com.example.art.MagicByteValidator
 import com.example.art.SceneArtGenerator
 import com.example.data.BuiltInPrompts
+import com.example.llm.AiHordeDirectorClient
 import com.example.llm.ChatPayloadCompatFlags
 import com.example.llm.JsonSanitizer
 import com.example.llm.LlmDirectorClient
@@ -1118,7 +1119,7 @@ class ToonForgeCoreTest {
         assertEquals(30L, LlmDirectorClient.CONNECT_TIMEOUT_SEC)
         assertEquals(180L, LlmDirectorClient.READ_TIMEOUT_SEC)
         assertEquals(60L, LlmDirectorClient.WRITE_TIMEOUT_SEC)
-        assertEquals(240L, LlmDirectorClient.CALL_TIMEOUT_SEC)
+        assertEquals(300L, LlmDirectorClient.CALL_TIMEOUT_SEC)
         assertEquals(4096, LlmDirectorClient.MAX_TOKENS)
 
         val llmErr = LlmHttpException(
@@ -1572,5 +1573,82 @@ class ToonForgeCoreTest {
         val bareExtracted = JsonSanitizer.extractJsonArrayText(thinkAndBareArray)
         assertTrue(bareExtracted.startsWith("["))
         assertTrue(bareExtracted.contains("\"scene_id\": 5"))
+    }
+
+    @Test
+    fun `aiHordeModeSwitchAndAsyncDirectorContracts`() {
+        // 1. StudioSettings defaults & anonymous AI Horde key fallback
+        val defaultSettings = StudioSettings()
+        assertFalse(defaultSettings.useAiHorde)
+        assertEquals("0000000000", defaultSettings.aiHordeApiKey)
+
+        val blankKeySettings = StudioSettings(useAiHorde = true, aiHordeKey = "  \n  ")
+        assertTrue(blankKeySettings.useAiHorde)
+        assertEquals("0000000000", blankKeySettings.aiHordeApiKey)
+
+        val customKeySettings = StudioSettings(useAiHorde = true, aiHordeKey = " horde_secret_123 \n")
+        assertEquals("horde_secret_123", customKeySettings.aiHordeApiKey)
+
+        // 2. AiHordeDirectorClient API endpoints, token limits, and 3s/180s polling constants
+        assertEquals("https://stablehorde.net/api/v2/generate/text/async", AiHordeDirectorClient.HORDE_TEXT_ASYNC_URL)
+        assertEquals("https://stablehorde.net/api/v2/generate/text/status/abc-123", AiHordeDirectorClient.buildStatusUrl(" abc-123 "))
+        assertEquals("0000000000", AiHordeDirectorClient.resolveApiKey(""))
+        assertEquals("custom_key_99", AiHordeDirectorClient.resolveApiKey(" custom_key_99\n"))
+        assertEquals(1024, AiHordeDirectorClient.MAX_LENGTH)
+        assertEquals(4096, AiHordeDirectorClient.MAX_CONTEXT_LENGTH)
+        assertEquals(3_000L, AiHordeDirectorClient.POLL_INTERVAL_MS)
+        assertEquals(180_000L, AiHordeDirectorClient.POLL_TIMEOUT_MS)
+
+        // 3. Live queue wait status message formatting
+        assertEquals(
+            "AI Horde generating script... (~42s left)",
+            AiHordeDirectorClient.formatQueueStatusMessage(42)
+        )
+        assertEquals(
+            "AI Horde generating script... (~0s left)",
+            AiHordeDirectorClient.formatQueueStatusMessage(-5)
+        )
+        assertTrue(
+            AiHordeDirectorClient.formatQueueStatusMessage(18, "Scenes 1–4/6")
+                .startsWith("AI Horde generating script... (~18s left)")
+        )
+
+        // 4. Direct AI Horde image timeout & LlmDirectorClient streaming timeout constants
+        assertEquals(45_000L, AiHordeImageClient.DIRECT_HORDE_POLL_TIMEOUT_MS)
+        assertEquals(30L, LlmDirectorClient.CONNECT_TIMEOUT_SEC)
+        assertEquals(180L, LlmDirectorClient.READ_TIMEOUT_SEC)
+        assertEquals(60L, LlmDirectorClient.WRITE_TIMEOUT_SEC)
+        assertEquals(300L, LlmDirectorClient.CALL_TIMEOUT_SEC)
+
+        // 5. Horde prompt construction and sequential continuation alignment
+        val budget30 = LlmDirectorClient.calculateDurationBudget(30)
+        val composed = BuiltInPrompts.composeSystemPrompt("Be funny", 30, AnimationStyle.PAPER_DIORAMA)
+        val prompt = AiHordeDirectorClient.buildHordeStoryboardPrompt(
+            composedSystemPrompt = composed,
+            topic = "Bakit laging ubos ang sweldo?",
+            durationSeconds = 30,
+            style = AnimationStyle.PAPER_DIORAMA,
+            budget = budget30,
+            batchRange = SceneBatchRange(3, 6),
+            previousBatchSummary = "Scenes 1-2 introduced Juan checking his empty wallet."
+        )
+        assertTrue(prompt.contains("Scenes 3..6"))
+        assertTrue(prompt.contains("Scenes 1-2 introduced Juan"))
+        assertTrue(prompt.endsWith(LlmDirectorClient.STRICT_JSON_OUTPUT_FOOTER))
+
+        val renumbered = (1..2).map { i ->
+            SceneScript(
+                sceneId = i,
+                tagalogNarration = "Pagpapatuloy $i ng kuwento tungkol sa tamang pagbabadyet bawat sahod.",
+                visualDescription = "Filipino narrator smiling holding a coffee mug beside a kitchen counter in warm morning sunlight.",
+                backgroundPrompt = "warm kitchen",
+                cameraMotion = CameraMotion.PAN_LEFT,
+                actorRole = ActorRole.HERO,
+                actorAction = ActorAction.TALK_BOUNCE,
+                worldFx = WorldFx.NONE
+            )
+        }
+        val aligned = AiHordeDirectorClient.alignSequentialHordeScenes(renumbered, SceneBatchRange(3, 6))
+        assertEquals(listOf(3, 4), aligned.map { it.sceneId })
     }
 }

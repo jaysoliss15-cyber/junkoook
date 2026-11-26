@@ -515,6 +515,7 @@ data class StudioSettings(
     val customBaseUrl: String = "",
     val customModel: String = "",
     val customApiKey: String = "",
+    val useAiHorde: Boolean = false,
     val aiHordeKey: String = "0000000000",
     val customSpritePaths: Map<String, String> = emptyMap(),
     val spriteStickerOutline: Boolean = true,
@@ -525,6 +526,9 @@ data class StudioSettings(
 ) {
     val activeTemplate: PromptTemplate?
         get() = promptTemplates.firstOrNull { it.id == activePromptId } ?: promptTemplates.firstOrNull()
+
+    val aiHordeApiKey: String
+        get() = aiHordeKey.replace("\r", "").replace("\n", "").trim().ifBlank { "0000000000" }
 
     val effectiveLlmBaseUrl: String
         get() = llmBaseUrl.ifBlank { customBaseUrl }.replace("\r", "").replace("\n", "").trim()

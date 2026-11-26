@@ -522,22 +522,34 @@ class LlmDirectorClient(
             }
 
             val contentType = resp.header("Content-Type").orEmpty().lowercase()
-            if (contentType.contains("text/event-stream")) {
+            val isSseHeader = contentType.contains("text/event-stream")
+            val source = respBody.source()
+            if (!isSseHeader) {
+                source.request(64L)
+            }
+            val headPreview = if (isSseHeader) {
+                ""
+            } else {
+                source.peek().readUtf8(minOf(source.buffer.size, 64L)).trimStart()
+            }
+
+            if (isSseHeader || headPreview.startsWith("data:") || headPreview.startsWith(":")) {
                 val rawSample = StringBuilder()
-                val choice = respBody.charStream().buffered().use { reader ->
+                val choice = source.inputStream().bufferedReader().use { reader ->
                     parseSseStreamLines(
                         lines = generateSequence { reader.readLine() },
                         rawCollector = rawSample
                     )
                 }
-                choice to rawSample.toString()
+                val sampleStr = rawSample.toString()
+                if (choice.content.isBlank() && sampleStr.trimStart().startsWith("{")) {
+                    parseOpenAiChoiceResult(sampleStr) to sampleStr
+                } else {
+                    choice to sampleStr
+                }
             } else {
                 val bodyStr = respBody.string()
-                if (!bodyStr.trimStart().startsWith("{") && bodyStr.contains("data:")) {
-                    parseSseStreamLines(bodyStr.lineSequence()) to bodyStr
-                } else {
-                    parseOpenAiChoiceResult(bodyStr) to bodyStr
-                }
+                parseOpenAiChoiceResult(bodyStr) to bodyStr
             }
         }
     }
@@ -546,7 +558,7 @@ class LlmDirectorClient(
         const val CONNECT_TIMEOUT_SEC = 30L
         const val READ_TIMEOUT_SEC = 180L
         const val WRITE_TIMEOUT_SEC = 60L
-        const val CALL_TIMEOUT_SEC = 240L
+        const val CALL_TIMEOUT_SEC = 300L
         const val MAX_TOKENS = 4096
         const val MAX_SCENES_PER_BATCH = 4
         const val FALLBACK_SCENES_PER_BATCH = 2

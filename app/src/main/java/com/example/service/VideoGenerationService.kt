@@ -19,6 +19,7 @@ import com.example.R
 import com.example.art.AiHordeImageClient
 import com.example.data.SettingsDataStore
 import com.example.data.VideoGalleryRepository
+import com.example.llm.AiHordeDirectorClient
 import com.example.llm.LlmDirectorClient
 import com.example.llm.UniversalModelDetector
 import com.example.model.ActorRole
@@ -165,9 +166,11 @@ class VideoGenerationService : Service() {
                 UniversalModelDetector.matchPresetForUrl(settings.effectiveLlmBaseUrl).defaultModelHint
             }
             val missingCreds = buildList {
-                if (settings.effectiveLlmBaseUrl.isBlank()) add("LLM Base URL")
-                if (settings.effectiveLlmApiKey.isBlank()) add("LLM API Key")
-                if (resolvedLlmModel.isBlank()) add("LLM Model ID")
+                if (!settings.useAiHorde) {
+                    if (settings.effectiveLlmBaseUrl.isBlank()) add("LLM Base URL")
+                    if (settings.effectiveLlmApiKey.isBlank()) add("LLM API Key")
+                    if (resolvedLlmModel.isBlank()) add("LLM Model ID")
+                }
                 if (settings.elevenLabsKeys.none { it.key.replace("\r", "").replace("\n", "").trim().isNotEmpty() }) {
                     add("ElevenLabs API Key")
                 }
@@ -213,18 +216,34 @@ class VideoGenerationService : Service() {
                 updateNotification(message, (overall * 100).toInt().coerceIn(0, 100))
             }
 
-            // STEP 1: SCRIPT GENERATION
-            publish(PipelineStep.SCRIPT, 0.1f, 0.05f, "Directing Tagalog story script...")
-            val llmClient = LlmDirectorClient()
-            val scriptResult = llmClient.generateStoryScript(
-                topic = topic,
-                durationSeconds = durationSec,
-                style = style,
-                settings = settings,
-                onStatus = { status ->
-                    publish(PipelineStep.SCRIPT, 0.5f, 0.12f, status)
-                }
-            )
+            // STEP 1: SCRIPT GENERATION (Strict explicit engine routing — zero silent fallback)
+            val initialScriptMsg = if (settings.useAiHorde) {
+                "Submitting Tagalog script to AI Horde queue..."
+            } else {
+                "Directing Tagalog story script..."
+            }
+            publish(PipelineStep.SCRIPT, 0.1f, 0.05f, initialScriptMsg)
+            val scriptResult = if (settings.useAiHorde) {
+                AiHordeDirectorClient().generateStoryScript(
+                    topic = topic,
+                    durationSeconds = durationSec,
+                    style = style,
+                    settings = settings,
+                    onStatus = { status ->
+                        publish(PipelineStep.SCRIPT, 0.5f, 0.12f, status)
+                    }
+                )
+            } else {
+                LlmDirectorClient().generateStoryScript(
+                    topic = topic,
+                    durationSeconds = durationSec,
+                    style = style,
+                    settings = settings,
+                    onStatus = { status ->
+                        publish(PipelineStep.SCRIPT, 0.5f, 0.12f, status)
+                    }
+                )
+            }
             val scenes = scriptResult.scenes
             publish(
                 PipelineStep.SCRIPT,
@@ -357,7 +376,11 @@ class VideoGenerationService : Service() {
             } else {
                 val imageClient = AiHordeImageClient()
                 val artBatchStartMsg = if (style.usesNetworkArt) {
-                    "Fetching ${scenes.size} ${style.badge} diorama backdrops in parallel..."
+                    if (settings.useAiHorde) {
+                        "Generating ${scenes.size} ${style.badge} backdrops via AI Horde..."
+                    } else {
+                        "Fetching ${scenes.size} ${style.badge} diorama backdrops in parallel..."
+                    }
                 } else {
                     "Generating ${scenes.size} offline ${style.badge} stages..."
                 }
@@ -373,12 +396,17 @@ class VideoGenerationService : Service() {
                 val backdropResults = imageClient.generateBackdropsBatch(
                     scenes = scenes,
                     style = style,
-                    aiHordeApiKey = settings.aiHordeKey,
-                    topicSeed = topic.hashCode()
+                    aiHordeApiKey = settings.aiHordeApiKey,
+                    topicSeed = topic.hashCode(),
+                    preferAiHordeDirect = settings.useAiHorde
                 ) { doneCount, totalCount ->
                     val frac = doneCount.toFloat() / totalCount.coerceAtLeast(1).toFloat()
                     val label = if (style.usesNetworkArt) {
-                        "Downloaded/rendered backdrop ($doneCount/$totalCount)..."
+                        if (settings.useAiHorde) {
+                            "AI Horde generated/rendered backdrop ($doneCount/$totalCount)..."
+                        } else {
+                            "Downloaded/rendered backdrop ($doneCount/$totalCount)..."
+                        }
                     } else {
                         "Prepared offline stage ($doneCount/$totalCount)..."
                     }

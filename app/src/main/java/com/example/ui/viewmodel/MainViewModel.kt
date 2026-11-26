@@ -599,9 +599,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             val effectiveVoice = cleanVoiceDraft.ifBlank { snapshot.effectiveVoiceId }
 
             val missing = buildList {
-                if (effectiveLlmBase.isBlank()) add("LLM Base URL")
-                if (effectiveLlmKey.isBlank()) add("LLM API Key")
-                if (resolvedModel.isBlank()) add("LLM Model ID")
+                if (!snapshot.useAiHorde) {
+                    if (effectiveLlmBase.isBlank()) add("LLM Base URL")
+                    if (effectiveLlmKey.isBlank()) add("LLM API Key")
+                    if (resolvedModel.isBlank()) add("LLM Model ID")
+                }
                 if (!hasElevenLabsKey) add("ElevenLabs API Key")
                 if (effectiveVoice.isBlank()) add("ElevenLabs Voice ID")
             }
@@ -928,6 +930,22 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun setUseAiHorde(enabled: Boolean) {
+        viewModelScope.launch {
+            settingsStore.setUseAiHorde(enabled)
+            showMessage(
+                if (enabled) "Switched to AI Horde Async Engine (ElevenLabs TTS stays active)"
+                else "Switched to Custom LLM API Engine"
+            )
+        }
+    }
+
+    fun setAiHordeKey(apiKey: String) {
+        viewModelScope.launch {
+            settingsStore.setAiHordeKey(apiKey)
+        }
+    }
+
     fun saveLlmSettings(
         llmBaseUrl: String,
         llmApiKey: String,
@@ -936,7 +954,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         ttsModelId: String = settings.value.effectiveTtsModelId,
         selectedVoiceId: String = settings.value.effectiveVoiceId,
         aiHordeKey: String = settings.value.aiHordeKey,
-        narrationSpeed: Float = settings.value.narrationSpeed
+        narrationSpeed: Float = settings.value.narrationSpeed,
+        useAiHorde: Boolean? = null
     ) {
         viewModelScope.launch {
             val cleanBase = UniversalModelDetector.cleanUrl(llmBaseUrl)
@@ -954,7 +973,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 ttsModelId = UniversalModelDetector.cleanCredential(ttsModelId),
                 selectedVoiceId = UniversalModelDetector.cleanCredential(selectedVoiceId),
                 aiHordeKey = UniversalModelDetector.cleanCredential(aiHordeKey),
-                narrationSpeed = narrationSpeed
+                narrationSpeed = narrationSpeed,
+                useAiHorde = useAiHorde
             )
             showMessage("API & Studio settings saved")
         }

@@ -22,6 +22,7 @@ import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -51,6 +52,7 @@ import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Save
 import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material.icons.rounded.Shuffle
+import androidx.compose.material.icons.rounded.SmartToy
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -202,6 +204,13 @@ fun StudioScreen(
         ) {
             // Studio Header Banner
             StudioTopHeader()
+
+            // Quick Engine Toggle Pill (Custom LLM API vs AI Horde Async Engine)
+            EngineQuickTogglePill(
+                useAiHorde = settings.useAiHorde,
+                activeModelId = settings.effectiveSelectedModelId,
+                onSelectAiHorde = { enabled -> viewModel.setUseAiHorde(enabled) }
+            )
 
             // 0. THREE STUDIO PRO PRODUCTION MODES + CLIP AUTO-HUD PICKER
             ProductionModeSelectorCard(
@@ -829,6 +838,138 @@ private fun StudioTopHeader() {
                         style = MaterialTheme.typography.labelMedium,
                         color = ForgeAmber
                     )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun EngineQuickTogglePill(
+    useAiHorde: Boolean,
+    activeModelId: String,
+    onSelectAiHorde: (Boolean) -> Unit
+) {
+    Surface(
+        color = StudioSurface,
+        shape = RoundedCornerShape(16.dp),
+        border = BorderStroke(
+            width = 1.dp,
+            color = if (useAiHorde) ForgeAmber.copy(alpha = 0.55f) else ForgeCyan.copy(alpha = 0.4f)
+        ),
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("studio_engine_toggle_pill")
+    ) {
+        Column(
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "Script & Art Engine",
+                    style = MaterialTheme.typography.labelLarge,
+                    fontWeight = FontWeight.Bold
+                )
+                Text(
+                    text = if (useAiHorde) {
+                        "AI Horde Queue • ElevenLabs TTS"
+                    } else {
+                        "${activeModelId.ifBlank { "Custom LLM" }} • ElevenLabs TTS"
+                    },
+                    style = MaterialTheme.typography.labelSmall,
+                    color = if (useAiHorde) ForgeAmber else ForgeCyan,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                val customSelected = !useAiHorde
+                Surface(
+                    color = if (customSelected) ForgeCyan.copy(alpha = 0.18f) else StudioSurfaceElevated,
+                    shape = RoundedCornerShape(12.dp),
+                    border = BorderStroke(
+                        width = if (customSelected) 1.5.dp else 1.dp,
+                        color = if (customSelected) ForgeCyan else StudioOutline
+                    ),
+                    modifier = Modifier
+                        .weight(1f)
+                        .heightIn(min = 48.dp)
+                        .clip(RoundedCornerShape(12.dp))
+                        .clickable { onSelectAiHorde(false) }
+                        .testTag("studio_engine_custom_llm_pill")
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 10.dp, vertical = 10.dp),
+                        horizontalArrangement = Arrangement.Center,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.SmartToy,
+                            contentDescription = "Custom LLM API",
+                            tint = if (customSelected) ForgeCyan else MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            text = "Custom LLM API",
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = if (customSelected) FontWeight.Bold else FontWeight.Medium,
+                            color = if (customSelected) ForgeCyan else MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+
+                val hordeSelected = useAiHorde
+                Surface(
+                    color = if (hordeSelected) ForgeAmber.copy(alpha = 0.20f) else StudioSurfaceElevated,
+                    shape = RoundedCornerShape(12.dp),
+                    border = BorderStroke(
+                        width = if (hordeSelected) 1.5.dp else 1.dp,
+                        color = if (hordeSelected) ForgeAmber else StudioOutline
+                    ),
+                    modifier = Modifier
+                        .weight(1f)
+                        .heightIn(min = 48.dp)
+                        .clip(RoundedCornerShape(12.dp))
+                        .clickable { onSelectAiHorde(true) }
+                        .testTag("studio_engine_ai_horde_pill")
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 10.dp, vertical = 10.dp),
+                        horizontalArrangement = Arrangement.Center,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.AutoAwesome,
+                            contentDescription = "AI Horde Async Engine",
+                            tint = if (hordeSelected) ForgeAmber else MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            text = "AI Horde Async",
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = if (hordeSelected) FontWeight.Bold else FontWeight.Medium,
+                            color = if (hordeSelected) ForgeAmber else MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
                 }
             }
         }

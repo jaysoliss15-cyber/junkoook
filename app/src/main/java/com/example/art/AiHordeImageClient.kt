@@ -47,6 +47,7 @@ class AiHordeImageClient(
 ) {
     companion object {
         const val POLL_TIMEOUT_MS = 25_000L
+        const val DIRECT_HORDE_POLL_TIMEOUT_MS = 45_000L
         const val POLLINATIONS_TIMEOUT_SEC = 20L
         private const val POLL_INTERVAL_MS = 2_000L
         const val MAX_CONCURRENT_JOBS = 2
@@ -74,6 +75,7 @@ class AiHordeImageClient(
         style: AnimationStyle,
         aiHordeApiKey: String,
         topicSeed: Int,
+        preferAiHordeDirect: Boolean = false,
         onSceneCompleted: suspend (completedCount: Int, totalCount: Int) -> Unit = { _, _ -> }
     ): List<BackdropResult> = coroutineScope {
         val semaphore = Semaphore(MAX_CONCURRENT_JOBS)
@@ -96,7 +98,8 @@ class AiHordeImageClient(
                         style = style,
                         aiHordeApiKey = aiHordeApiKey,
                         seed = scene.sceneId * 1013 + topicSeed,
-                        environmentTheme = scene.environmentTheme
+                        environmentTheme = scene.environmentTheme,
+                        preferAiHordeDirect = preferAiHordeDirect
                     )
                     val count = completed.incrementAndGet()
                     onSceneCompleted(count, total)
@@ -111,7 +114,8 @@ class AiHordeImageClient(
         style: AnimationStyle,
         aiHordeApiKey: String,
         seed: Int,
-        environmentTheme: EnvironmentTheme? = null
+        environmentTheme: EnvironmentTheme? = null,
+        preferAiHordeDirect: Boolean = false
     ): BackdropResult = withContext(Dispatchers.IO) {
         // Stickman Whiteboard & 2D Viral Explainer skip cloud image calls for crisp procedural 2D stages
         if (!style.usesNetworkArt) {
@@ -129,12 +133,23 @@ class AiHordeImageClient(
         }
 
         val fullPrompt = "$scenePrompt, ${style.backdropPromptSuffix}"
-        // Primary: Pollinations Flux (up to 3 verified retries with progressive backoff); Backup: AI Horde
-        val decoded = tryFetchPollinationsImageWithRetry(fullPrompt)
-            ?: tryFetchAiHordeImage(
+        val cleanHordeKey = aiHordeApiKey.replace("\r", "").replace("\n", "").trim().ifBlank { "0000000000" }
+        val decoded = if (preferAiHordeDirect) {
+            // AI Horde Mode ON: route scene art directly to AI Horde async workers
+            tryFetchAiHordeImage(
                 prompt = fullPrompt,
-                apiKey = aiHordeApiKey.replace("\r", "").replace("\n", "").trim().ifBlank { "0000000000" }
+                apiKey = cleanHordeKey,
+                pollTimeoutMs = DIRECT_HORDE_POLL_TIMEOUT_MS
             )
+        } else {
+            // Custom LLM Mode: Pollinations Flux primary (3 retries) -> AI Horde backup
+            tryFetchPollinationsImageWithRetry(fullPrompt)
+                ?: tryFetchAiHordeImage(
+                    prompt = fullPrompt,
+                    apiKey = cleanHordeKey,
+                    pollTimeoutMs = POLL_TIMEOUT_MS
+                )
+        }
 
         if (decoded != null) {
             val scaled = scaleCenterCrop(decoded, 1080, 1920)
@@ -187,7 +202,11 @@ class AiHordeImageClient(
         }
     }
 
-    private suspend fun tryFetchAiHordeImage(prompt: String, apiKey: String): Bitmap? {
+    private suspend fun tryFetchAiHordeImage(
+        prompt: String,
+        apiKey: String,
+        pollTimeoutMs: Long = POLL_TIMEOUT_MS
+    ): Bitmap? {
         return try {
             val payload = JSONObject().apply {
                 put("prompt", prompt)
@@ -222,7 +241,7 @@ class AiHordeImageClient(
             } ?: return null
 
             val startMs = System.currentTimeMillis()
-            while (System.currentTimeMillis() - startMs < POLL_TIMEOUT_MS) {
+            while (System.currentTimeMillis() - startMs < pollTimeoutMs) {
                 delay(POLL_INTERVAL_MS)
                 val checkReq = Request.Builder()
                     .url("https://aihorde.net/api/v2/generate/check/$jobId")

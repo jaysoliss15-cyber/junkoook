@@ -37,6 +37,7 @@ class SettingsDataStore(private val context: Context) {
         val CUSTOM_BASE_URL = stringPreferencesKey("custom_base_url")
         val CUSTOM_MODEL = stringPreferencesKey("custom_model")
         val CUSTOM_API_KEY = stringPreferencesKey("custom_api_key")
+        val USE_AI_HORDE = booleanPreferencesKey("use_ai_horde")
         val AI_HORDE_KEY = stringPreferencesKey("ai_horde_key")
         val CUSTOM_SPRITE_PATHS_JSON = stringPreferencesKey("custom_sprite_paths_json")
         val SPRITE_STICKER_OUTLINE = booleanPreferencesKey("sprite_sticker_outline")
@@ -84,6 +85,7 @@ class SettingsDataStore(private val context: Context) {
             customBaseUrl = legacyBaseUrl,
             customModel = legacyModel,
             customApiKey = legacyApiKey,
+            useAiHorde = prefs[Keys.USE_AI_HORDE] ?: false,
             aiHordeKey = cleanCredential(prefs[Keys.AI_HORDE_KEY]).ifBlank { "0000000000" },
             customSpritePaths = parseSpritePaths(prefs[Keys.CUSTOM_SPRITE_PATHS_JSON]),
             spriteStickerOutline = prefs[Keys.SPRITE_STICKER_OUTLINE] ?: true,
@@ -214,7 +216,8 @@ class SettingsDataStore(private val context: Context) {
         ttsModelId: String = "eleven_multilingual_v2",
         selectedVoiceId: String? = null,
         aiHordeKey: String = "0000000000",
-        narrationSpeed: Float? = null
+        narrationSpeed: Float? = null,
+        useAiHorde: Boolean? = null
     ) {
         val cleanBase = cleanCredential(llmBaseUrl)
         val cleanKey = cleanCredential(llmApiKey)
@@ -237,9 +240,25 @@ class SettingsDataStore(private val context: Context) {
                 prefs[Keys.SELECTED_VOICE_ID] = cleanCredential(selectedVoiceId).ifBlank { "N2IVS1w4EtoT3dr4eOWO" }
             }
             prefs[Keys.AI_HORDE_KEY] = cleanHorde
+            if (useAiHorde != null) {
+                prefs[Keys.USE_AI_HORDE] = useAiHorde
+            }
             if (narrationSpeed != null) {
                 prefs[Keys.NARRATION_SPEED] = narrationSpeed.coerceIn(0.85f, 1.15f)
             }
+        }
+    }
+
+    suspend fun setUseAiHorde(enabled: Boolean) {
+        context.settingsDataStore.edit { prefs ->
+            prefs[Keys.USE_AI_HORDE] = enabled
+        }
+    }
+
+    suspend fun setAiHordeKey(apiKey: String) {
+        val cleanHorde = cleanCredential(apiKey).ifBlank { "0000000000" }
+        context.settingsDataStore.edit { prefs ->
+            prefs[Keys.AI_HORDE_KEY] = cleanHorde
         }
     }
 
